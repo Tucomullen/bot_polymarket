@@ -19,6 +19,7 @@ Integración con el Quoting Engine:
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,6 +29,8 @@ import httpx
 from src.quoting import Quote, QuotePair
 
 logger = logging.getLogger("polybot.orders")
+
+_VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() != "false"
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +113,7 @@ class OrderManager:
     ):
         self.cfg = cfg or OrderManagerConfig()
         self._clob = clob_client              # py-clob-client ClobClient autenticado
-        self._http = httpx.AsyncClient(timeout=10.0)
+        self._http = httpx.AsyncClient(timeout=10.0, verify=_VERIFY_SSL)
 
         # Estado local de órdenes
         self._live_orders: dict[str, LiveOrder] = {}   # order_id → LiveOrder

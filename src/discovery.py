@@ -28,6 +28,7 @@ Supuestos sobre la API de Polymarket (encapsulados para corrección rápida):
 """
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -37,6 +38,8 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger("polybot.discovery")
+
+_VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() != "false"
 
 
 # ===========================================================================
@@ -198,7 +201,7 @@ class MarketDiscovery:
 
     def __init__(self, cfg: DiscoveryConfig | None = None):
         self.cfg = cfg or DiscoveryConfig()
-        self._http = httpx.AsyncClient(timeout=15.0)
+        self._http = httpx.AsyncClient(timeout=15.0, verify=_VERIFY_SSL)
         self._reward_markets: dict[str, dict] = {}  # cache de rewards
         self._last_scan: float = 0.0
         self._cached_ranking: list[MarketCandidate] = []

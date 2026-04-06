@@ -15,7 +15,24 @@ import asyncio
 import logging
 import signal
 import sys
+import os
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# SSL bypass (proxy corporativo con certificado auto-firmado)
+# Activar con VERIFY_SSL=false en .env
+# ---------------------------------------------------------------------------
+# Cargamos .env manualmente aquí porque load_dotenv() ocurre más tarde (en settings.py)
+from pathlib import Path as _Path
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv(_Path(__file__).resolve().parent / ".env")
+
+if os.getenv("VERIFY_SSL", "true").lower() == "false":
+    import httpx
+    # py_clob_client crea _http_client = httpx.Client(http2=True) al importar el módulo.
+    # Hay que reemplazarlo por uno con verify=False ANTES de cualquier llamada a la API.
+    import py_clob_client.http_helpers.helpers as _clob_helpers
+    _clob_helpers._http_client = httpx.Client(http2=True, verify=False)  # type: ignore[assignment]
 
 from config.settings import load_config
 from src.auth import Authenticator
@@ -24,7 +41,6 @@ from src.orderbook import OrderbookTracker
 from src.discovery import MarketDiscovery, DiscoveryConfig, MarketCandidate
 from src.trading_loop import TradingLoop
 
-import os
 
 def _optional_env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()

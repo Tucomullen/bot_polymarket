@@ -15,6 +15,8 @@ Características:
 import asyncio
 import json
 import logging
+import os
+import ssl
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -24,6 +26,13 @@ import websockets
 from websockets.asyncio.client import connect as ws_connect
 
 from config.settings import WebSocketConfig
+
+_VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() != "false"
+_SSL_CONTEXT: ssl.SSLContext | None = None
+if not _VERIFY_SSL:
+    _SSL_CONTEXT = ssl.create_default_context()
+    _SSL_CONTEXT.check_hostname = False
+    _SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 logger = logging.getLogger("polybot.ws")
 
@@ -151,6 +160,7 @@ class PolymarketWSConnection:
             ping_timeout=None,
             close_timeout=5,
             max_size=2**20,  # 1 MB máx por mensaje
+            ssl=_SSL_CONTEXT,
         ) as ws:
             self._ws = ws
             self._reconnect_delay = self.INITIAL_RECONNECT_DELAY
