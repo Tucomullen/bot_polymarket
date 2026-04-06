@@ -40,6 +40,7 @@ from src.websocket_manager import WebSocketManager, WSSAuth
 from src.orderbook import OrderbookTracker
 from src.discovery import MarketDiscovery, DiscoveryConfig, MarketCandidate
 from src.trading_loop import TradingLoop
+from src.risk_manager import RiskManager
 
 
 def _optional_env(name: str, default: str = "") -> str:
@@ -237,8 +238,26 @@ async def run_bot() -> None:
             "📡 Suscrito a user channel — %d mercados", len(condition_ids)
         )
 
-    # 6. Inicializar Trading Loop (Fase 2)
+    # 6. Inicializar Risk Manager (Fase 4) + Trading Loop
     global trading_loop
+
+    bankroll_usd = float(_optional_env("BANKROLL_USD", "1000"))
+
+    risk_manager = RiskManager(
+        bankroll_usd=bankroll_usd,
+        kelly_fraction=cfg.risk.kelly_fraction,
+        max_order_risk_pct=cfg.risk.max_bankroll_risk_pct,
+        max_total_exposure_pct=float(_optional_env("MAX_TOTAL_EXPOSURE_PCT", "0.20")),
+        max_session_loss_pct=float(_optional_env("MAX_SESSION_LOSS_PCT", "0.05")),
+        max_consecutive_errors=int(_optional_env("MAX_CONSECUTIVE_ERRORS", "10")),
+    )
+    logger.info(
+        "🛡️  Risk Manager — Kelly=%.2f | max_order=%.0f%% | max_exposure=%.0f%% | kill_loss=%.0f%%",
+        cfg.risk.kelly_fraction,
+        cfg.risk.max_bankroll_risk_pct * 100,
+        float(_optional_env("MAX_TOTAL_EXPOSURE_PCT", "0.20")) * 100,
+        float(_optional_env("MAX_SESSION_LOSS_PCT", "0.05")) * 100,
+    )
 
     if discovered_markets:
         trading_loop = TradingLoop(
@@ -246,8 +265,9 @@ async def run_bot() -> None:
             orderbook=orderbook_tracker,
             clob_client=clob_client,
             simulation=cfg.simulation_mode,
-            bankroll_usd=float(_optional_env("BANKROLL_USD", "1000")),
+            bankroll_usd=bankroll_usd,
             cycle_interval_ms=float(_optional_env("CYCLE_INTERVAL_MS", "500")),
+            risk_manager=risk_manager,
         )
         logger.info(
             "🔄 Trading loop configurado — %d mercados, simulation=%s",

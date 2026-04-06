@@ -98,7 +98,8 @@ Ahora verás líneas adicionales en el log:
 | 2 | Estrategia Maker + Velocidad | ✅ | Cotización bidireccional, cancel/replace, fee-rate dinámico |
 | SSL | Bypass proxy corporativo | ✅ | VERIFY_SSL para entornos con proxy y cert auto-firmado |
 | 3 | Tarifas, Firmas y Re-scan | ✅ | Enriquecimiento real de scoring, re-scan periódico cada 5 min |
-| 4 | Gestión de Riesgo | ⏳ | Auto-hedge, Kelly fraccional, kill switch, límites de exposición |
+| 4 | Gestión de Riesgo | ✅ | Kill switch, Kelly fraccional, exposición total, P&L tracking |
+| 5 | Monitorización | ⏳ | Dashboard, alertas, auto-restart |
 
 ---
 

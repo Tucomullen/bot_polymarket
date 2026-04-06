@@ -111,7 +111,8 @@ DISCOVERY_RESCAN_SEC=600   # 10 min (si quieres reducir llamadas a la API)
 | 2 | ✅ | Cotización bidireccional, cancel/replace, fee-rate dinámico |
 | SSL | ✅ | Bypass SSL para proxy corporativo (VERIFY_SSL) |
 | 3 | ✅ | Enriquecimiento real de scoring, re-scan periódico, firma verificada |
-| 4 | ⏳ | Gestión de Riesgo: auto-hedge, Kelly fraccional, kill switch, límites de exposición |
+| 4 | ✅ | Kill switch, Kelly fraccional, exposición total, P&L tracking |
+| 5 | ⏳ | Monitorización avanzada: dashboard, alertas, auto-restart |
 
 ---
 

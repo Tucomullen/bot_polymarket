@@ -17,10 +17,13 @@ Principios:
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.orderbook import OrderbookTracker, OrderbookState
 from src.discovery import MarketCandidate
+
+if TYPE_CHECKING:
+    from src.risk_manager import RiskManager
 
 logger = logging.getLogger("polybot.quoting")
 
@@ -134,6 +137,7 @@ class QuotingEngine:
         inventory_yes: float = 0.0,
         inventory_no: float = 0.0,
         bankroll_usd: float = 1000.0,
+        risk_manager: "RiskManager | None" = None,
     ) -> QuotePair:
         """
         Genera un par de cotizaciones bid/ask para el mercado dado.
@@ -198,8 +202,11 @@ class QuotingEngine:
             logger.debug("⚠️  bid >= ask tras ajustes, no se cotiza: bid=%.3f ask=%.3f", bid_price, ask_price)
             return QuotePair(market=market)
 
-        # 8. Calcular tamaño
-        size_usd = self._compute_order_size(market, bankroll_usd)
+        # 8. Calcular tamaño (Kelly si hay risk_manager, otherwise lógica legacy)
+        half_spread_cents = (ask_price - bid_price) * 100 / 2.0
+        size_usd = self._compute_order_size(
+            market, bankroll_usd, half_spread_cents, mid, risk_manager
+        )
         bid_shares = size_usd / bid_price if bid_price > 0 else 0
         ask_shares = size_usd / ask_price if ask_price > 0 else 0
 
@@ -334,26 +341,42 @@ class QuotingEngine:
         return skew
 
     def _compute_order_size(
-        self, market: MarketCandidate, bankroll_usd: float
+        self,
+        market: MarketCandidate,
+        bankroll_usd: float,
+        half_spread_cents: float = 1.0,
+        mid_price: float = 0.5,
+        risk_manager: "RiskManager | None" = None,
     ) -> float:
-        """Calcula el tamaño de la orden en USD."""
-        size = self.cfg.base_order_size_usd
+        """
+        Calcula el tamaño de la orden en USD.
 
-        # Escalar por score del mercado (mejor score → más capital)
-        if self.cfg.scale_size_by_score and market.score > 0:
-            score_factor = market.score / 70.0  # 70 = score "bueno"
-            size *= max(0.3, min(score_factor, 2.0))
-
-        # Respetar el min_size de rewards si aplica
-        if market.reward_min_size > 0:
-            size = max(size, market.reward_min_size)
-
-        # Limitar al rango configurado
-        size = max(self.cfg.min_order_size_usd, min(size, self.cfg.max_order_size_usd))
-
-        # No superar un % del bankroll
-        max_from_bankroll = bankroll_usd * 0.05  # Máx 5% del bankroll por orden
-        size = min(size, max_from_bankroll)
+        Si se proporciona risk_manager, usa Kelly fraccional para el sizing.
+        Si no, usa la lógica legacy con cap fijo del 5% del bankroll.
+        """
+        if risk_manager is not None:
+            # Kelly fraccional: el risk_manager considera exposición total y Kelly
+            kelly_max = risk_manager.max_order_size_usd(
+                market.condition_id, half_spread_cents, mid_price
+            )
+            # Escalar por score (mejor mercado → más del presupuesto Kelly)
+            if self.cfg.scale_size_by_score and market.score > 0:
+                score_factor = market.score / 70.0
+                kelly_max *= max(0.3, min(score_factor, 2.0))
+            # Respetar min_size de rewards
+            if market.reward_min_size > 0:
+                kelly_max = max(kelly_max, market.reward_min_size)
+            size = max(self.cfg.min_order_size_usd, min(kelly_max, self.cfg.max_order_size_usd))
+        else:
+            # Lógica legacy: base_order_size escalada por score, cap 5% bankroll
+            size = self.cfg.base_order_size_usd
+            if self.cfg.scale_size_by_score and market.score > 0:
+                score_factor = market.score / 70.0
+                size *= max(0.3, min(score_factor, 2.0))
+            if market.reward_min_size > 0:
+                size = max(size, market.reward_min_size)
+            size = max(self.cfg.min_order_size_usd, min(size, self.cfg.max_order_size_usd))
+            size = min(size, bankroll_usd * 0.05)
 
         return size
 

@@ -24,6 +24,7 @@ from src.discovery import MarketCandidate
 from src.orderbook import OrderbookTracker
 from src.quoting import QuotingEngine, QuotingConfig
 from src.order_manager import OrderManager, OrderManagerConfig
+from src.risk_manager import RiskManager
 
 logger = logging.getLogger("polybot.loop")
 
@@ -45,6 +46,7 @@ class TradingLoop:
         simulation: bool = True,
         bankroll_usd: float = 1000.0,
         cycle_interval_ms: float = 500,   # Intervalo entre ciclos en ms
+        risk_manager: RiskManager | None = None,
     ):
         self._markets = markets
         self._orderbook = orderbook
@@ -53,6 +55,7 @@ class TradingLoop:
         self._cycle_interval = cycle_interval_ms / 1000.0
         self._running = False
         self._cycle_count = 0
+        self._risk = risk_manager  # None en modo legacy (sin gestión de riesgo)
 
         # Componentes
         self._quoting = QuotingEngine(
@@ -100,6 +103,8 @@ class TradingLoop:
                         self._orders.metrics["fills_received"],
                         self._orders.metrics["errors"],
                     )
+                    if self._risk is not None:
+                        self._risk.log_stats()
 
                 # Esperar hasta el siguiente ciclo
                 elapsed = time.monotonic() - cycle_start
@@ -124,13 +129,26 @@ class TradingLoop:
 
     async def _run_cycle(self) -> None:
         """Ejecuta un ciclo completo de market making."""
+        # Comprobar kill switch antes de procesar cualquier mercado
+        if self._risk is not None:
+            triggered, reason = self._risk.check_kill_switch()
+            if triggered:
+                logger.critical("🚨 KILL SWITCH activo (%s) — deteniendo el bot", reason)
+                await self._orders.cancel_all()
+                self._running = False
+                return
+
         for market in self._markets:
             try:
                 await self._process_market(market)
+                if self._risk is not None:
+                    self._risk.record_success()
             except Exception:
                 logger.exception(
                     "❌ Error procesando mercado %s", market.question[:40]
                 )
+                if self._risk is not None:
+                    self._risk.record_error()
 
     async def _process_market(self, market: MarketCandidate) -> None:
         """Procesa un mercado individual en un ciclo."""
@@ -144,12 +162,13 @@ class TradingLoop:
         # Obtener inventario actual
         inv_yes, inv_no = self._orders.get_inventory(market.condition_id)
 
-        # Generar nuevas quotes
+        # Generar nuevas quotes (con Kelly sizing si hay risk_manager)
         pair = self._quoting.generate_quotes(
             market=market,
             inventory_yes=inv_yes,
             inventory_no=inv_no,
             bankroll_usd=self._bankroll,
+            risk_manager=self._risk,
         )
 
         if not pair.is_complete:
@@ -184,6 +203,14 @@ class TradingLoop:
 
         if event_type == "trade":
             self._orders.process_fill(data)
+            # Registrar fill en el risk manager para actualizar P&L y posición
+            if self._risk is not None:
+                cid = data.get("market", data.get("condition_id", ""))
+                side = data.get("side", "")
+                price = float(data.get("price", 0))
+                size = float(data.get("size", data.get("matched_amount", 0)))
+                if cid and side and price and size:
+                    self._risk.record_fill(cid, side.upper(), price, size)
         elif event_type == "order":
             self._orders.process_order_update(data)
 
