@@ -1,0 +1,284 @@
+"""
+main.py — Punto de entrada del bot de trading Polymarket.
+
+Fase 1 (Prompt 1): Conexión, autenticación, WebSocket y Discovery.
+Ejecuta el flujo:
+  1. Carga configuración desde .env
+  2. Autenticación L1 + L2 contra el CLOB
+  3. Discovery: escanea y rankea los mejores mercados automáticamente
+  4. Conexión WebSocket a canales market + user
+  5. Heartbeat automático cada 10 s
+  6. Logging de eventos en consola (modo simulación)
+"""
+
+import asyncio
+import logging
+import signal
+import sys
+from typing import Any
+
+from config.settings import load_config
+from src.auth import Authenticator
+from src.websocket_manager import WebSocketManager, WSSAuth
+from src.orderbook import OrderbookTracker
+from src.discovery import MarketDiscovery, DiscoveryConfig, MarketCandidate
+from src.trading_loop import TradingLoop
+
+import os
+
+def _optional_env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(name)-18s │ %(levelname)-5s │ %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("polybot.main")
+
+
+# ---------------------------------------------------------------------------
+# Callbacks de eventos WebSocket
+# ---------------------------------------------------------------------------
+
+orderbook_tracker = OrderbookTracker()
+trading_loop: TradingLoop | None = None  # Se inicializa tras el discovery
+
+
+async def on_market_event(data: dict[str, Any] | list) -> None:
+    """
+    Callback para eventos del canal market.
+    Despacha según event_type al tracker del orderbook.
+    El canal market puede enviar una lista de eventos o un único dict.
+    """
+    if isinstance(data, list):
+        for item in data:
+            await on_market_event(item)
+        return
+    event_type = data.get("event_type", "")
+
+    if event_type == "book":
+        orderbook_tracker.process_book_event(data)
+    elif event_type == "price_change":
+        orderbook_tracker.process_price_change(data)
+    elif event_type == "last_trade_price":
+        orderbook_tracker.process_last_trade(data)
+    else:
+        logger.debug("📨 Evento market no clasificado: %s", event_type)
+
+
+async def on_user_event(data: dict[str, Any]) -> None:
+    """
+    Callback para eventos del canal user.
+    Despacha a:
+      - Trading loop (para procesar fills y actualizar inventario)
+      - Log (para visibilidad)
+    """
+    event_type = data.get("event_type", "")
+
+    # Despachar al trading loop si está activo
+    if trading_loop is not None:
+        trading_loop.on_user_event(data)
+
+    if event_type == "trade":
+        logger.info(
+            "💰 TRADE recibido — side=%s, price=%s, size=%s, status=%s",
+            data.get("side"),
+            data.get("price"),
+            data.get("size"),
+            data.get("status"),
+        )
+    elif event_type == "order":
+        logger.info(
+            "📋 ORDER update — type=%s, side=%s, price=%s, outcome=%s",
+            data.get("type"),
+            data.get("side"),
+            data.get("price"),
+            data.get("outcome"),
+        )
+    else:
+        logger.debug("📨 Evento user no clasificado: %s", event_type)
+
+
+# ---------------------------------------------------------------------------
+# Punto de entrada
+# ---------------------------------------------------------------------------
+
+async def run_bot() -> None:
+    """Flujo principal del bot."""
+
+    logger.info("=" * 60)
+    logger.info("   POLYMARKET TRADING BOT — FASE 1: CONEXIÓN")
+    logger.info("=" * 60)
+
+    # 1. Cargar configuración
+    cfg = load_config()
+    logger.info(
+        "⚙️  Config cargada — simulation=%s, chain=%d",
+        cfg.simulation_mode,
+        cfg.auth.chain_id,
+    )
+
+    if cfg.simulation_mode:
+        logger.info("🧪 MODO SIMULACIÓN activado — no se enviarán órdenes reales")
+
+    # 2. Autenticar contra el CLOB
+    authenticator = Authenticator(cfg.auth)
+    clob_client = authenticator.authenticate()
+
+    # 3. Preparar credenciales WSS para el canal user
+    wss_auth = None
+    if cfg.auth.api_key and cfg.auth.api_secret and cfg.auth.api_passphrase:
+        wss_auth = WSSAuth(
+            apiKey=cfg.auth.api_key,
+            secret=cfg.auth.api_secret,
+            passphrase=cfg.auth.api_passphrase,
+        )
+    else:
+        # Tras autenticar, las credenciales están en el cliente
+        creds = clob_client.get_api_creds() if hasattr(clob_client, 'get_api_creds') else None
+        if creds:
+            wss_auth = WSSAuth(
+                apiKey=creds.api_key,
+                secret=creds.api_secret,
+                passphrase=creds.api_passphrase,
+            )
+
+    # 4. Configurar WebSocket Manager
+    ws_manager = WebSocketManager(
+        ws_cfg=cfg.ws,
+        on_market_event=on_market_event,
+        on_user_event=on_user_event,
+        auth=wss_auth,
+    )
+
+    # 5. Discovery: encontrar los mejores mercados automáticamente
+    #    Si hay tokens manuales en .env, se usan esos.
+    #    Si no, el discovery escanea y selecciona los mejores.
+    token_ids = []
+    condition_ids = []
+    discovered_markets: list[MarketCandidate] = []  # Para el Trading Loop
+
+    manual_tokens = []
+    if cfg.market.token_id_yes:
+        manual_tokens.append(cfg.market.token_id_yes)
+    if cfg.market.token_id_no:
+        manual_tokens.append(cfg.market.token_id_no)
+
+    if manual_tokens:
+        # Modo manual: usar los tokens configurados en .env
+        token_ids = manual_tokens
+        if cfg.market.condition_id:
+            condition_ids = [cfg.market.condition_id]
+        logger.info("📌 Modo manual — usando tokens de .env (%d tokens)", len(token_ids))
+    else:
+        # Modo automático: discovery
+        logger.info("🔍 No hay tokens manuales en .env — activando Discovery...")
+        discovery_cfg = DiscoveryConfig(
+            clob_host=cfg.auth.clob_host,
+            max_active_markets=int(
+                _optional_env("MAX_ACTIVE_MARKETS", "5")
+            ),
+        )
+        discovery = MarketDiscovery(discovery_cfg)
+
+        try:
+            ranked_markets = await discovery.scan()
+            discovered_markets = ranked_markets  # Guardar para el Trading Loop
+
+            for m in ranked_markets:
+                if m.token_id_yes:
+                    token_ids.append(m.token_id_yes)
+                if m.token_id_no:
+                    token_ids.append(m.token_id_no)
+                if m.condition_id:
+                    condition_ids.append(m.condition_id)
+
+                # Mostrar desglose del score
+                logger.info("\n%s", discovery.explain_score(m))
+
+            if not token_ids and not condition_ids:
+                logger.warning(
+                    "⚠️  Discovery no encontró mercados válidos. "
+                    "Configura tokens manualmente en .env o ajusta los filtros."
+                )
+        except Exception:
+            logger.exception("❌ Error en Discovery")
+        finally:
+            await discovery.close()
+
+    if token_ids:
+        ws_manager.subscribe_market(token_ids)
+        logger.info("📡 Suscrito a market channel — %d tokens", len(token_ids))
+
+    if condition_ids:
+        ws_manager.subscribe_user(condition_ids)
+        logger.info(
+            "📡 Suscrito a user channel — %d mercados", len(condition_ids)
+        )
+
+    # 6. Inicializar Trading Loop (Fase 2)
+    global trading_loop
+
+    if discovered_markets:
+        trading_loop = TradingLoop(
+            markets=discovered_markets,
+            orderbook=orderbook_tracker,
+            clob_client=clob_client,
+            simulation=cfg.simulation_mode,
+            bankroll_usd=float(_optional_env("BANKROLL_USD", "1000")),
+            cycle_interval_ms=float(_optional_env("CYCLE_INTERVAL_MS", "500")),
+        )
+        logger.info(
+            "🔄 Trading loop configurado — %d mercados, simulation=%s",
+            len(discovered_markets),
+            cfg.simulation_mode,
+        )
+
+    # 7. Lanzar WebSockets + Trading Loop con manejo de señal para cierre limpio
+    loop = asyncio.get_running_loop()
+
+    def _signal_handler():
+        logger.info("🛑 Señal de cierre recibida...")
+        if trading_loop:
+            asyncio.create_task(trading_loop.stop())
+        asyncio.create_task(ws_manager.stop())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            # Windows no soporta add_signal_handler
+            pass
+
+    # Lanzar todo concurrentemente
+    tasks = [asyncio.create_task(ws_manager.start(), name="ws")]
+    if trading_loop:
+        # Dar 2 segundos al WebSocket para conectar antes de empezar a cotizar
+        async def _delayed_trading():
+            logger.info("⏳ Esperando 2s para que el WebSocket se estabilice...")
+            await asyncio.sleep(2.0)
+            await trading_loop.run()
+        tasks.append(asyncio.create_task(_delayed_trading(), name="trading"))
+
+    logger.info("🚀 Bot iniciado — WebSocket + Trading Loop activos")
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def main():
+    """Entry point del script."""
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logger.info("👋 Bot detenido por el usuario.")
+    except Exception:
+        logger.exception("💥 Error fatal")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
