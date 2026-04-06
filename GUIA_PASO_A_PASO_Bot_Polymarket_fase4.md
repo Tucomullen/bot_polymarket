@@ -113,23 +113,25 @@ MAX_TOTAL_EXPOSURE_PCT=0.30
 MAX_SESSION_LOSS_PCT=0.10
 ```
 
-**⏳ TAREA: Ejecutar en simulación y verificar logs de riesgo**
+**✅ VERIFICADO — Ejecución real confirmada (Abril 2026)**
 
-```bash
-python main.py
 ```
-
-Deberías ver al arrancar:
-```
-🛡️  Risk Manager — Kelly=0.25 | max_order=5% | max_exposure=20% | kill_loss=5%
-```
-
-Y cada 100 ciclos (~50s a 500ms/ciclo):
-```
-📊 Riesgo — PnL=0.0000 | Exposición=0.0% ($0.00) | Errores=0 | KS=✅ | Uptime=0.8min
+22:44:10 │ 🛡️  Risk Manager — Kelly=0.25 | max_order=5% | max_exposure=20% | kill_loss=5%
+22:44:10 │ 🔄 Trading loop configurado — 5 mercados, simulation=True
+22:44:10 │ ⏳ Esperando 2s para que el WebSocket se estabilice...
+22:44:12 │ 🔄 Trading loop iniciado — 5 mercados, interval=500ms, simulation=True
+22:45:04 │ 📊 Ciclo #100 — 0.5ms | created=10, cancelled=0, fills=0, errors=0
+22:45:04 │ 📊 Riesgo — PnL=0.0000 | Exposición=0.0% ($0.00) | Errores=0 | KS=✅ | Uptime=0.9min
 ```
 
-En simulación el P&L siempre será 0 (las órdenes no se llenan realmente). En live, este número reflejará el spread capturado.
+- **Risk Manager** aparece al arrancar ✅
+- **Trading loop** inicia a los 2s ✅
+- **Ciclo #100** a los ~54s (100 × 500ms) ✅
+- **Log de riesgo** cada 100 ciclos ✅
+
+> En simulación el P&L siempre será 0 (las órdenes no se envían). En live, este número reflejará el spread capturado en fills reales.
+
+> **Nota:** para que el trading loop pudiera arrancar correctamente fue necesario corregir dos bugs en componentes de Fase 1 (ver `GUIA_PASO_A_PASO_Bot_Polymarket_fase1.md` → sección *Bugfixes*): deadlock en `OrderbookTracker` y event loop starvation en `WebSocketManager`.
 
 ---
 

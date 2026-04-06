@@ -235,4 +235,24 @@ El módulo `src/discovery.py` ejecuta este pipeline cada 5 minutos:
 
 ---
 
-*Última actualización: Fase 1 + Discovery — Abril 2026*
+## Bugfixes aplicados sobre componentes de Fase 1
+
+### Bug 1 — Deadlock en `OrderbookTracker` (commit `d850e02`)
+
+**Causa raíz:** `process_book_event`, `process_price_change` y `process_last_trade` llamaban a `get_or_create()` dentro de un bloque `with self._lock:`. Como `threading.Lock` **no es reentrante**, el segundo intento de adquirir el lock provocaba un deadlock permanente que congelaba el event loop de asyncio: ningún `asyncio.sleep()` de otras corrutinas (trading loop, re-scan, heartbeat) podía dispararse jamás.
+
+**Fix:** se eliminó la llamada a `get_or_create()` dentro del lock y se sustituyó por acceso directo al dict (`if token_id not in self._books: self._books[token_id] = ...`) dentro del mismo bloque, sin adquirir el lock por segunda vez.
+
+**Síntoma observable:** el bot arrancaba (auth OK, discovery OK, WebSocket conectado) pero el trading loop nunca ejecutaba el Ciclo #100 ni los logs de riesgo.
+
+### Bug 2 — Event loop starvation en `WebSocketManager` (commit `d850e02`)
+
+**Causa raíz:** cuando el servidor de Polymarket envía ráfagas de mensajes, `asyncio.Queue.get()` no suspende si la cola tiene elementos — procesa mensaje tras mensaje sin ceder el control. Esto privaba de CPU a otras corrutinas (`asyncio.sleep()` del trading loop, re-scan, etc.).
+
+**Fix:** se añade `await asyncio.sleep(0)` al final de `_handle_message` para forzar un yield al event loop tras cada mensaje, permitiendo que el scheduler de asyncio ejecute otras tareas pendientes.
+
+**Síntoma observable:** el trading loop podía quedar bloqueado esperando tras una ráfaga inicial de eventos `book` del WebSocket.
+
+---
+
+*Última actualización: Fase 1 + Discovery + Bugfixes — Abril 2026*
