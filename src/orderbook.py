@@ -109,7 +109,9 @@ class OrderbookTracker:
         )
 
         with self._lock:
-            book = self.get_or_create(token_id)
+            if token_id not in self._books:
+                self._books[token_id] = OrderbookState(token_id=token_id)
+            book = self._books[token_id]
             book.bids = bids
             book.asks = asks
             book.last_update = time.time()
@@ -131,8 +133,9 @@ class OrderbookTracker:
             if not token_id:
                 continue
             with self._lock:
-                book = self.get_or_create(token_id)
-                book.last_update = time.time()
+                if token_id not in self._books:
+                    self._books[token_id] = OrderbookState(token_id=token_id)
+                self._books[token_id].last_update = time.time()
 
     def process_last_trade(self, data: dict[str, Any]) -> None:
         """Procesa un evento 'last_trade_price'."""
@@ -140,6 +143,8 @@ class OrderbookTracker:
         price = data.get("price")
         if token_id and price:
             with self._lock:
-                book = self.get_or_create(token_id)
+                if token_id not in self._books:
+                    self._books[token_id] = OrderbookState(token_id=token_id)
+                book = self._books[token_id]
                 book.last_trade_price = float(price)
                 book.last_update = time.time()
