@@ -509,10 +509,31 @@ class MarketDiscovery:
 
     async def _enrich_candidates(self, candidates: list[MarketCandidate]) -> None:
         """
-        Placeholder para enriquecimiento futuro con datos del CLOB autenticado.
-        El spread y bid/ask ya vienen de la Gamma API (bestBid, bestAsk).
-        El fee-rate requiere auth L2 y se añadirá en Fase 2.
+        Enriquece candidatos con datos del CLOB: fee-rate y top-of-book.
+        Usa un semáforo para no saturar la API (máx 5 llamadas paralelas).
         """
+        import asyncio as _asyncio
+
+        sem = _asyncio.Semaphore(5)
+
+        async def _enrich_one(c: MarketCandidate) -> None:
+            if not c.token_id_yes:
+                return
+            async with sem:
+                await _asyncio.gather(
+                    self._fetch_fee_rate(c),
+                    self._fetch_top_of_book(c),
+                    return_exceptions=True,
+                )
+
+        await _asyncio.gather(*[_enrich_one(c) for c in candidates], return_exceptions=True)
+
+        rebates = sum(1 for c in candidates if c.has_maker_rebates)
+        logger.info(
+            "   💸 %d candidatos enriquecidos — %d con maker rebates",
+            len(candidates),
+            rebates,
+        )
 
     async def _fetch_fee_rate(self, c: MarketCandidate) -> None:
         """

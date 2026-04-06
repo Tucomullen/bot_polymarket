@@ -178,6 +178,7 @@ async def run_bot() -> None:
     token_ids = []
     condition_ids = []
     discovered_markets: list[MarketCandidate] = []  # Para el Trading Loop
+    discovery: MarketDiscovery | None = None  # Se asigna solo en modo auto-discovery
 
     manual_tokens = []
     if cfg.market.token_id_yes:
@@ -224,8 +225,7 @@ async def run_bot() -> None:
                 )
         except Exception:
             logger.exception("❌ Error en Discovery")
-        finally:
-            await discovery.close()
+        # No cerramos discovery aquí — lo reutilizaremos para el re-scan periódico
 
     if token_ids:
         ws_manager.subscribe_market(token_ids)
@@ -271,6 +271,23 @@ async def run_bot() -> None:
             # Windows no soporta add_signal_handler
             pass
 
+    # Re-scan periódico del discovery (cada 5 minutos)
+    _RESCAN_INTERVAL_SEC = int(_optional_env("DISCOVERY_RESCAN_SEC", "300"))
+
+    async def _rescan_loop() -> None:
+        """Re-escanea mercados periódicamente y actualiza el trading loop."""
+        await asyncio.sleep(_RESCAN_INTERVAL_SEC)  # Primera espera antes del primer re-scan
+        while True:
+            try:
+                logger.info("🔍 Re-scan periódico de mercados...")
+                new_markets = await discovery.scan(force=True)
+                if new_markets and trading_loop:
+                    trading_loop.update_markets(new_markets)
+                    logger.info("✅ Re-scan completado — %d mercados activos", len(new_markets))
+            except Exception:
+                logger.exception("❌ Error en re-scan periódico")
+            await asyncio.sleep(_RESCAN_INTERVAL_SEC)
+
     # Lanzar todo concurrentemente
     tasks = [asyncio.create_task(ws_manager.start(), name="ws")]
     if trading_loop:
@@ -281,8 +298,15 @@ async def run_bot() -> None:
             await trading_loop.run()
         tasks.append(asyncio.create_task(_delayed_trading(), name="trading"))
 
-    logger.info("🚀 Bot iniciado — WebSocket + Trading Loop activos")
-    await asyncio.gather(*tasks, return_exceptions=True)
+    if discovery:
+        tasks.append(asyncio.create_task(_rescan_loop(), name="rescan"))
+
+    logger.info("🚀 Bot iniciado — WebSocket + Trading Loop + Re-scan activos")
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        if discovery:
+            await discovery.close()
 
 
 def main():

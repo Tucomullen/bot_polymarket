@@ -227,9 +227,10 @@ El módulo `src/discovery.py` ejecuta este pipeline cada 5 minutos:
 | Fase | Prompt | Estado | Qué implementa |
 |------|--------|--------|-----------------|
 | 1 | Conexión, Auth + Discovery | ✅ COMPLETADA | Auth L1/L2, WebSocket, Heartbeat, Market Selector |
-| 2 | Estrategia Maker | ⏳ PENDIENTE | Cotización bidireccional, bucle cancel/replace <100ms |
-| 3 | Tarifas y Firmas | ⏳ PENDIENTE | Consulta dinámica fee-rate, firma con feeRateBps |
-| 4 | Gestión de Riesgo | ⏳ PENDIENTE | Auto-hedge, Kelly fraccional, límite de spread |
+| 2 | Estrategia Maker + Velocidad | ✅ COMPLETADA | Cotización bidireccional, bucle cancel/replace, fee-rate dinámico |
+| SSL | Bypass proxy corporativo | ✅ COMPLETADA | VERIFY_SSL para entornos con proxy y cert auto-firmado |
+| 3 | Tarifas, Firmas y Re-scan | ✅ COMPLETADA | Enriquecimiento real de scoring, re-scan periódico |
+| 4 | Gestión de Riesgo | ⏳ PENDIENTE | Auto-hedge, Kelly fraccional, kill switch, límites de exposición |
 
 ---
 

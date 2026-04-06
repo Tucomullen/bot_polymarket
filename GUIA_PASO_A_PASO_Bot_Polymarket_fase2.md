@@ -96,10 +96,9 @@ Ahora verás líneas adicionales en el log:
 |------|--------|--------|-----------------|
 | 1 | Conexión, Auth + Discovery | ✅ | Auth L1/L2, WebSocket, Heartbeat, Market Selector |
 | 2 | Estrategia Maker + Velocidad | ✅ | Cotización bidireccional, cancel/replace, fee-rate dinámico |
-| 3 | Tarifas y Firmas | ⏳ | Refinar firma con feeRateBps (ya integrado en Order Manager) |
+| SSL | Bypass proxy corporativo | ✅ | VERIFY_SSL para entornos con proxy y cert auto-firmado |
+| 3 | Tarifas, Firmas y Re-scan | ✅ | Enriquecimiento real de scoring, re-scan periódico cada 5 min |
 | 4 | Gestión de Riesgo | ⏳ | Auto-hedge, Kelly fraccional, kill switch, límites de exposición |
-
-**Nota sobre Fase 3:** La consulta dinámica de `feeRateBps` ya está implementada en el Order Manager de esta Fase 2 (método `_get_fee_rate`). La Fase 3 puede enfocarse en refinar la firma criptográfica del payload si hay issues específicos.
 
 ---
 
