@@ -297,7 +297,7 @@ Ejecutar el bot en modo simulación durante 1-2 semanas en un entorno de servido
 | **5a — Unit Tests** | ✅ Completada (95/95 tests pasan) |
 | **5b — Backtesting** | ✅ Completada (backtesting/ con 5 módulos) |
 | **5c — Dashboard + Alertas** | ✅ Completada (FastAPI SSE + Telegram) |
-| **5d — Oracle Cloud + Paper Trading** | ⏳ Pendiente |
+| **5d — Oracle Cloud + Paper Trading** | ✅ Scripts + guía listos. Ejecutar paper trading 7-14 días. |
 | **Producción (DigitalOcean)** | 🔒 Bloqueada hasta 5a+5b+5c+5d |
 
 ---
