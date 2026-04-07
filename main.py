@@ -41,6 +41,8 @@ from src.orderbook import OrderbookTracker
 from src.discovery import MarketDiscovery, DiscoveryConfig, MarketCandidate
 from src.trading_loop import TradingLoop
 from src.risk_manager import RiskManager
+from src.dashboard import DashboardServer, BotState, DashboardLogHandler
+from src.telegram_alerts import TelegramAlerter
 
 
 def _optional_env(name: str, default: str = "") -> str:
@@ -57,6 +59,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("polybot.main")
 
+# Estado compartido del dashboard (módulo-level para acceso desde callbacks)
+bot_state = BotState()
+
 
 # ---------------------------------------------------------------------------
 # Callbacks de eventos WebSocket
@@ -64,6 +69,7 @@ logger = logging.getLogger("polybot.main")
 
 orderbook_tracker = OrderbookTracker()
 trading_loop: TradingLoop | None = None  # Se inicializa tras el discovery
+telegram: TelegramAlerter = TelegramAlerter.from_env()
 
 
 async def on_market_event(data: dict[str, Any] | list) -> None:
@@ -109,6 +115,14 @@ async def on_user_event(data: dict[str, Any]) -> None:
             data.get("size"),
             data.get("status"),
         )
+        bot_state.push_event({
+            "type": "TRADE",
+            "side": data.get("side", ""),
+            "price": data.get("price", ""),
+            "question": data.get("market", "")[:30],
+            "condition_id": data.get("market", ""),
+            "simulation": False,
+        })
     elif event_type == "order":
         logger.info(
             "📋 ORDER update — type=%s, side=%s, price=%s, outcome=%s",
@@ -117,6 +131,14 @@ async def on_user_event(data: dict[str, Any]) -> None:
             data.get("price"),
             data.get("outcome"),
         )
+        bot_state.push_event({
+            "type": "ORDER",
+            "side": data.get("side", ""),
+            "price": data.get("price", ""),
+            "question": "",
+            "condition_id": "",
+            "simulation": False,
+        })
     else:
         logger.debug("📨 Evento user no clasificado: %s", event_type)
 
@@ -129,7 +151,7 @@ async def run_bot() -> None:
     """Flujo principal del bot."""
 
     logger.info("=" * 60)
-    logger.info("   POLYMARKET TRADING BOT — FASE 1: CONEXIÓN")
+    logger.info("   POLYMARKET TRADING BOT")
     logger.info("=" * 60)
 
     # 1. Cargar configuración
@@ -142,6 +164,14 @@ async def run_bot() -> None:
 
     if cfg.simulation_mode:
         logger.info("🧪 MODO SIMULACIÓN activado — no se enviarán órdenes reales")
+
+    # 1b. Configurar log handler del dashboard (logs en memoria + fichero)
+    log_dir = _optional_env("LOG_DIR", "logs")
+    dash_handler = DashboardLogHandler(bot_state, log_dir=log_dir)
+    dash_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-5s %(name)s — %(message)s", datefmt="%H:%M:%S"
+    ))
+    logging.getLogger().addHandler(dash_handler)
 
     # 2. Autenticar contra el CLOB
     authenticator = Authenticator(cfg.auth)
@@ -275,6 +305,17 @@ async def run_bot() -> None:
             cfg.simulation_mode,
         )
 
+    # 6b. Conectar BotState con los componentes del bot
+    bot_state.wire(
+        risk_manager=risk_manager,
+        trading_loop=trading_loop,
+        simulation=cfg.simulation_mode,
+        bankroll=bankroll_usd,
+    )
+    for m in discovered_markets:
+        bot_state.update_quote(m.condition_id, m.question,
+                               m.best_bid, m.best_ask, m.midpoint)
+
     # 7. Lanzar WebSockets + Trading Loop con manejo de señal para cierre limpio
     loop = asyncio.get_running_loop()
 
@@ -308,8 +349,24 @@ async def run_bot() -> None:
                 logger.exception("❌ Error en re-scan periódico")
             await asyncio.sleep(_RESCAN_INTERVAL_SEC)
 
+    # Notificar arranque por Telegram
+    await telegram.send_startup(
+        simulation=cfg.simulation_mode,
+        n_markets=len(discovered_markets),
+        bankroll=bankroll_usd,
+    )
+
     # Lanzar todo concurrentemente
-    tasks = [asyncio.create_task(ws_manager.start(), name="ws")]
+    dashboard_port = int(_optional_env("DASHBOARD_PORT", "8080"))
+    dashboard_server = DashboardServer(
+        state=bot_state,
+        port=dashboard_port,
+        password=_optional_env("DASHBOARD_PASSWORD", ""),
+    )
+    tasks = [
+        asyncio.create_task(ws_manager.start(), name="ws"),
+        asyncio.create_task(dashboard_server.start(), name="dashboard"),
+    ]
     if trading_loop:
         # Dar 2 segundos al WebSocket para conectar antes de empezar a cotizar
         async def _delayed_trading():

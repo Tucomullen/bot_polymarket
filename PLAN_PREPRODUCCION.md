@@ -296,7 +296,7 @@ Ejecutar el bot en modo simulación durante 1-2 semanas en un entorno de servido
 | 4 — Gestión de Riesgo (Kill switch + Kelly) | ✅ Completada |
 | **5a — Unit Tests** | ✅ Completada (95/95 tests pasan) |
 | **5b — Backtesting** | ✅ Completada (backtesting/ con 5 módulos) |
-| **5c — Dashboard + Alertas** | ⏳ Pendiente |
+| **5c — Dashboard + Alertas** | ✅ Completada (FastAPI SSE + Telegram) |
 | **5d — Oracle Cloud + Paper Trading** | ⏳ Pendiente |
 | **Producción (DigitalOcean)** | 🔒 Bloqueada hasta 5a+5b+5c+5d |
 

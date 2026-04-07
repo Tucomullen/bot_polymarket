@@ -16,3 +16,12 @@ httpx>=0.27.0
 # Utilidades criptográficas (dependencia de py-clob-client)
 eth-account>=0.11.0
 web3>=6.0.0
+
+# Dashboard
+fastapi>=0.111.0
+uvicorn>=0.30.0
+
+# Testing
+pytest>=8.0
+pytest-asyncio>=0.23
+respx>=0.21
