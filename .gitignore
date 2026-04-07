@@ -3,3 +3,7 @@ venv/
 __pycache__/
 *.pyc
 .claude/
+
+# Backtest
+backtesting/data/
+backtesting/report_*.html
