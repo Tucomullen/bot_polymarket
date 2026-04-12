@@ -27,7 +27,10 @@ Supuestos sobre la API de Polymarket (encapsulados para corrección rápida):
      Si Polymarket cambia la nomenclatura, ajustar _CRYPTO_SHORT_TERM_PATTERNS.
 """
 
+import asyncio
+import json as _json
 import logging
+import math
 import os
 import re
 import time
@@ -232,11 +235,10 @@ class MarketDiscovery:
         logger.info("🔍 Iniciando escaneo de mercados...")
 
         # 1. Obtener mercados activos de Gamma
-        #    (Los datos de rewards vienen incluidos en cada mercado)
         raw_markets = await self._fetch_gamma_markets()
         logger.info("   📊 %d mercados activos obtenidos de Gamma", len(raw_markets))
 
-        # 3. Construir candidatos
+        # 2. Construir candidatos
         candidates = []
         for raw in raw_markets:
             c = self._parse_candidate(raw)
@@ -245,21 +247,21 @@ class MarketDiscovery:
 
         logger.info("   🏗️  %d candidatos parseados", len(candidates))
 
-        # 4. Filtros duros (antes del enriquecimiento para reducir llamadas al CLOB)
+        # 3. Filtros duros (antes del enriquecimiento para reducir llamadas al CLOB)
         filtered = self._apply_hard_filters(candidates)
         logger.info("   🔬 %d candidatos tras filtros duros", len(filtered))
 
-        # 5. Enriquecer solo los candidatos que pasaron los filtros
+        # 4. Enriquecer solo los candidatos que pasaron los filtros
         await self._enrich_candidates(filtered)
 
-        # 6. Scoring
+        # 5. Scoring
         for c in filtered:
             self._compute_score(c)
 
-        # 7. Ordenar por score
+        # 6. Ordenar por score
         filtered.sort(key=lambda x: x.score, reverse=True)
 
-        # 8. Tomar top N
+        # 7. Tomar top N
         top = filtered[: self.cfg.max_active_markets]
 
         self._cached_ranking = top
@@ -310,10 +312,9 @@ class MarketDiscovery:
                 resp.raise_for_status()
                 data = resp.json()
 
-                # La Gamma API devuelve una lista directa o un objeto con paginación
                 if isinstance(data, list):
                     all_markets.extend(data)
-                    break  # Sin paginación explícita
+                    break
                 elif isinstance(data, dict):
                     markets = data.get("data", data.get("markets", []))
                     all_markets.extend(markets)
@@ -335,7 +336,6 @@ class MarketDiscovery:
     def _parse_candidate(self, raw: dict) -> MarketCandidate | None:
         """Convierte un market de la Gamma API en MarketCandidate."""
         try:
-            # La Gamma API usa camelCase
             condition_id = raw.get("conditionId", raw.get("condition_id", ""))
 
             # Listas de control
@@ -359,7 +359,6 @@ class MarketDiscovery:
                     return None
 
             # Tokens — la Gamma API devuelve clobTokenIds como string JSON
-            import json as _json
             clob_token_ids = raw.get("clobTokenIds", [])
             if isinstance(clob_token_ids, str):
                 try:
@@ -374,23 +373,20 @@ class MarketDiscovery:
             elif isinstance(clob_token_ids, list) and len(clob_token_ids) == 1:
                 token_yes = str(clob_token_ids[0])
 
-            # Precios — la Gamma API los devuelve directamente como bestBid/bestAsk
+            # Precios
             best_bid = float(raw.get("bestBid", 0) or 0)
             best_ask = float(raw.get("bestAsk", 0) or 0)
             last_trade = float(raw.get("lastTradePrice", 0) or 0)
 
-            # Midpoint: preferir bestBid/bestAsk, fallback a outcomePrices
             if best_bid > 0 and best_ask > 0:
                 midpoint = (best_bid + best_ask) / 2.0
                 spread_cents = round((best_ask - best_bid) * 100, 2)
             else:
-                # Fallback a outcomePrices
                 outcome_prices = raw.get("outcomePrices", "")
                 midpoint = 0.5
                 spread_cents = 99.0
                 if isinstance(outcome_prices, str) and outcome_prices:
                     try:
-                        import json as _json
                         prices = _json.loads(outcome_prices)
                         midpoint = float(prices[0]) if prices else 0.5
                     except Exception:
@@ -401,24 +397,17 @@ class MarketDiscovery:
             question = raw.get("question", raw.get("title", ""))
             slug = raw.get("slug", "")
 
-            # Clasificar categoría
             category = self._classify_category(question, slug, tags)
 
-            # Volumen — preferir volumeClob (más preciso) o volume24hr
             volume_24h = float(raw.get("volume24hrClob", raw.get("volume24hr", 0)) or 0)
-
-            # Liquidez
             liquidity = float(raw.get("liquidityClob", raw.get("liquidity", 0)) or 0)
-
-            # Fecha de finalización
             end_date = raw.get("endDateIso", raw.get("endDate", ""))
             hours_to_res = self._hours_until(end_date)
 
-            # Rewards — datos en clobRewards[] y campos raíz
+            # Rewards
             clob_rewards = raw.get("clobRewards", [])
             rewards_daily_rate = 0.0
             if clob_rewards and isinstance(clob_rewards, list):
-                # Sumar las tasas diarias de todos los reward programs activos
                 rewards_daily_rate = sum(
                     float(r.get("rewardsDailyRate", 0) or 0) for r in clob_rewards
                 )
@@ -426,7 +415,6 @@ class MarketDiscovery:
             rewards_min_size = float(raw.get("rewardsMinSize", 0) or 0)
             rewards_max_spread = float(raw.get("rewardsMaxSpread", 0) or 0)
             reward_competitors = int(raw.get("competitive", 0) or 0)
-
             has_liq_rewards = rewards_daily_rate > 0
 
             c = MarketCandidate(
@@ -463,10 +451,7 @@ class MarketDiscovery:
     def _classify_category(
         self, question: str, slug: str, tags: list[str]
     ) -> MarketCategory:
-        """
-        Clasifica un mercado en categoría según su texto y tags.
-        ⚠️ SUPUESTO 1 y 4: Depende de la nomenclatura de Polymarket.
-        """
+        """Clasifica un mercado en categoría según su texto y tags."""
         text = f"{question} {slug} {' '.join(tags)}"
 
         if _CRYPTO_SHORT_TERM_PATTERNS.search(text):
@@ -480,7 +465,7 @@ class MarketDiscovery:
         if _POLITICS_PATTERNS.search(text):
             return MarketCategory.POLITICS_GEOPOLITICS
         if _CRYPTO_GENERAL_PATTERNS.search(text):
-            return MarketCategory.CRYPTO_SHORT_TERM  # Crypto genérico → tier 1
+            return MarketCategory.CRYPTO_SHORT_TERM
         return MarketCategory.UNKNOWN
 
     @staticmethod
@@ -490,8 +475,6 @@ class MarketDiscovery:
             return 9999.0
         try:
             from datetime import datetime, timezone
-
-            # Manejar varios formatos
             for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d"):
                 try:
                     dt = datetime.strptime(iso_date, fmt).replace(tzinfo=timezone.utc)
@@ -504,29 +487,24 @@ class MarketDiscovery:
         return 9999.0
 
     # ------------------------------------------------------------------
-    # Paso 4: Enriquecer con datos del CLOB
+    # Paso 3: Enriquecer con datos del CLOB
     # ------------------------------------------------------------------
 
     async def _enrich_candidates(self, candidates: list[MarketCandidate]) -> None:
-        """
-        Enriquece candidatos con datos del CLOB: fee-rate y top-of-book.
-        Usa un semáforo para no saturar la API (máx 5 llamadas paralelas).
-        """
-        import asyncio as _asyncio
-
-        sem = _asyncio.Semaphore(5)
+        """Enriquece candidatos con datos del CLOB: fee-rate y top-of-book."""
+        sem = asyncio.Semaphore(5)
 
         async def _enrich_one(c: MarketCandidate) -> None:
             if not c.token_id_yes:
                 return
             async with sem:
-                await _asyncio.gather(
+                await asyncio.gather(
                     self._fetch_fee_rate(c),
                     self._fetch_top_of_book(c),
                     return_exceptions=True,
                 )
 
-        await _asyncio.gather(*[_enrich_one(c) for c in candidates], return_exceptions=True)
+        await asyncio.gather(*[_enrich_one(c) for c in candidates], return_exceptions=True)
 
         rebates = sum(1 for c in candidates if c.has_maker_rebates)
         logger.info(
@@ -536,11 +514,7 @@ class MarketDiscovery:
         )
 
     async def _fetch_fee_rate(self, c: MarketCandidate) -> None:
-        """
-        Consulta GET /fee-rate?tokenID={id}.
-        Si retorna > 0, el mercado tiene taker fees → maker rebates.
-        ⚠️ SUPUESTO 3.
-        """
+        """Consulta GET /fee-rate?tokenID={id}."""
         try:
             resp = await self._http.get(
                 f"{self.cfg.clob_host}/fee-rate",
@@ -551,7 +525,7 @@ class MarketDiscovery:
                 bps = int(data.get("fee_rate_bps", data.get("feeRateBps", 0)) or 0)
                 c.fee_rate_bps = bps
                 c.has_taker_fees = bps > 0
-                c.has_maker_rebates = bps > 0  # Rebates existen donde hay taker fees
+                c.has_maker_rebates = bps > 0
         except Exception as exc:
             logger.debug("   ⚠️  fee-rate error para %s: %s", c.condition_id[:12], exc)
 
@@ -579,68 +553,53 @@ class MarketDiscovery:
             logger.debug("   ⚠️  book error para %s: %s", c.condition_id[:12], exc)
 
     # ------------------------------------------------------------------
-    # Paso 5: Filtros duros
+    # Paso 4: Filtros duros
     # ------------------------------------------------------------------
 
     def _apply_hard_filters(self, candidates: list[MarketCandidate]) -> list[MarketCandidate]:
         """Descarta mercados que no cumplen los mínimos."""
         result = []
         for c in candidates:
-            # Volumen (si la Gamma API reportó 0, puede ser que el campo sea distinto)
             if c.volume_24h < self.cfg.min_volume_24h and c.volume_24h > 0:
                 continue
-            # Spread — solo filtrar si realmente obtuvimos datos del book
-            # (spread_cents=99 significa que no pudimos leer el book)
             if c.spread_cents < 90 and c.spread_cents > self.cfg.max_spread_cents:
                 continue
-            # Precio (evitar mercados ya decididos)
             mid = c.midpoint
             if mid < self.cfg.min_price or mid > self.cfg.max_price:
                 continue
-            # Tiempo hasta resolución
             if c.hours_to_resolution < self.cfg.min_time_to_resolution_hours:
                 continue
-
             result.append(c)
-
         return result
 
     # ------------------------------------------------------------------
-    # Paso 6: Scoring
+    # Paso 5: Scoring
     # ------------------------------------------------------------------
 
     def _compute_score(self, c: MarketCandidate) -> None:
-        """
-        Calcula el score compuesto del mercado.
-        Cada componente se normaliza a [0, 100] y se pondera.
-        """
+        """Calcula el score compuesto del mercado."""
         scores: dict[str, float] = {}
 
-        # 1. Categoría (mejor categoría = mayor score)
-        #    cat 1 → 100, cat 2 → 75, cat 3 → 50, cat 4 → 30, cat 5 → 10
+        # 1. Categoría
         cat_scores = {1: 100, 2: 75, 3: 50, 4: 30, 5: 10}
         scores["category"] = cat_scores.get(int(c.category), 10)
 
         # 2. Maker rebates (binario)
         scores["maker_rebates"] = 100.0 if c.has_maker_rebates else 0.0
 
-        # 3. Liquidity rewards (binario + monto)
+        # 3. Liquidity rewards
         if c.has_liquidity_rewards:
-            # Normalizar: $100/día = 100 puntos, $10/día = 50, $0 = 0
             scores["liquidity_rewards"] = min(100.0, c.daily_reward_usd * 1.0)
         else:
             scores["liquidity_rewards"] = 0.0
 
         # 4. Volumen 24h (logarítmico)
-        #    $1k = 30, $10k = 60, $100k = 80, $1M+ = 100
-        import math
         if c.volume_24h > 0:
             scores["volume"] = min(100.0, 20.0 * math.log10(max(c.volume_24h, 1)))
         else:
             scores["volume"] = 0.0
 
         # 5. Spread (menor = mejor)
-        #    0.5¢ = 100, 2¢ = 70, 5¢ = 30, 8¢+ = 0
         if c.spread_cents <= 0.5:
             scores["spread"] = 100.0
         elif c.spread_cents >= 8.0:
@@ -648,29 +607,26 @@ class MarketDiscovery:
         else:
             scores["spread"] = max(0.0, 100.0 - (c.spread_cents - 0.5) * 13.3)
 
-        # 6. Centralidad del precio (cercanía a 0.50)
-        #    0.50 = 100, 0.30/0.70 = 50, 0.10/0.90 = 10
+        # 6. Centralidad del precio
         distance = abs(c.midpoint - 0.50)
         scores["price_centrality"] = max(0.0, 100.0 - distance * 200.0)
 
-        # 7. Frecuencia de trades (más = mejor, normalizado)
+        # 7. Frecuencia de trades
         scores["trade_frequency"] = min(100.0, c.recent_trade_count * 2.0)
 
         # 8. Tiempo hasta resolución
-        #    Muy corto (<1h) = penalizado, medio (1-48h) = ideal, largo (>7d) = ok pero menos
         if c.hours_to_resolution < 1:
             scores["time_to_resolution"] = 20.0
         elif c.hours_to_resolution <= 48:
             scores["time_to_resolution"] = 100.0
-        elif c.hours_to_resolution <= 168:  # 7 días
+        elif c.hours_to_resolution <= 168:
             scores["time_to_resolution"] = 70.0
         else:
             scores["time_to_resolution"] = 40.0
 
-        # 9. Riesgo de evento brusco (penalización)
-        #    Crypto corto plazo = bajo riesgo (predecible), política = alto
+        # 9. Riesgo de evento brusco
         event_risk_map = {
-            MarketCategory.CRYPTO_SHORT_TERM: 90.0,  # Bajo riesgo de evento brusco
+            MarketCategory.CRYPTO_SHORT_TERM: 90.0,
             MarketCategory.SPORTS_ESPORTS: 70.0,
             MarketCategory.FINANCE_ECONOMICS: 60.0,
             MarketCategory.TECH_WEATHER: 50.0,
@@ -679,7 +635,7 @@ class MarketDiscovery:
         }
         scores["event_risk"] = event_risk_map.get(c.category, 40.0)
 
-        # 10. Competencia de otros makers (menos = mejor)
+        # 10. Competencia de otros makers
         if c.reward_competitors <= 2:
             scores["competition"] = 100.0
         elif c.reward_competitors <= 10:
@@ -689,7 +645,7 @@ class MarketDiscovery:
         else:
             scores["competition"] = 10.0
 
-        # --- Score final ponderado ---
+        # Score final ponderado
         weights = {
             "category": self.cfg.w_category,
             "maker_rebates": self.cfg.w_maker_rebates,

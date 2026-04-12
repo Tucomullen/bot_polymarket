@@ -241,9 +241,6 @@ class PolymarketWSConnection:
             logger.exception("❌ Error procesando evento en canal %s", self._channel.value)
 
         # Ceder control al event loop para que los timers (sleep) puedan disparar.
-        # Necesario cuando el servidor envía ráfagas de mensajes que llenan el buffer
-        # interno de websockets: asyncio.Queue.get() no suspende si hay datos, bloqueando
-        # el event loop y evitando que corran asyncio.sleep() de otras corrutinas.
         await asyncio.sleep(0)
 
 

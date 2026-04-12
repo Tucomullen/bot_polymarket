@@ -231,7 +231,7 @@ El módulo `src/discovery.py` ejecuta este pipeline cada 5 minutos:
 | SSL | Bypass proxy corporativo | ✅ COMPLETADA | VERIFY_SSL para entornos con proxy y cert auto-firmado |
 | 3 | Tarifas, Firmas y Re-scan | ✅ COMPLETADA | Enriquecimiento real de scoring, re-scan periódico |
 | 4 | Gestión de Riesgo | ✅ COMPLETADA | Kill switch, Kelly fraccional, exposición total, P&L tracking |
-| 5 | Monitorización | ⏳ PENDIENTE | Dashboard, alertas, auto-restart |
+| 5 | Monitorización | ✅ COMPLETADA | Dashboard FastAPI SSE + Telegram + Backtesting |
 
 ---
 

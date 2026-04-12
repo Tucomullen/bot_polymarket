@@ -4,12 +4,10 @@ backtesting/report.py — Genera un informe HTML con gráficas del backtest.
 Genera un único archivo HTML auto-contenido con:
   - Tabla resumen por mercado
   - Gráfica de P&L acumulado
-  - Gráfica de precio histórico + nuestros bids/asks
   - Distribución de fills
 """
 
 import logging
-import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,10 +23,8 @@ logger = logging.getLogger("polybot.backtest.report")
 
 def _sparkline_svg(values: list[float], width: int = 200, height: int = 40,
                    color: str = "#22c55e") -> str:
-    """Genera un sparkline SVG simple para una serie de valores."""
     if len(values) < 2:
         return f'<svg width="{width}" height="{height}"></svg>'
-
     mn = min(values)
     mx = max(values)
     rng = mx - mn if mx != mn else 1.0
@@ -50,13 +46,11 @@ def _sparkline_svg(values: list[float], width: int = 200, height: int = 40,
 
 def _pnl_chart_svg(steps: list[SimStep], fills: list[FillEvent],
                    width: int = 700, height: int = 200) -> str:
-    """Genera un SVG del P&L acumulado con marcadores de fills."""
     if len(steps) < 2:
         return f'<svg width="{width}" height="{height}"><text x="10" y="20" fill="#888">Sin datos</text></svg>'
 
     pnl_values = [s.cumulative_pnl for s in steps]
     ts_values = [s.timestamp for s in steps]
-
     mn = min(pnl_values)
     mx = max(pnl_values)
     rng = mx - mn if mx != mn else 1.0
@@ -73,17 +67,13 @@ def _pnl_chart_svg(steps: list[SimStep], fills: list[FillEvent],
     def sy(v: float) -> float:
         return pad + inner_h - ((v - mn) / rng) * inner_h
 
-    # Línea de P&L
     points = " ".join(f"{sx(s.timestamp):.1f},{sy(s.cumulative_pnl):.1f}" for s in steps)
-
-    # Línea del cero
     zero_y = sy(0.0)
     zero_line = (
         f'<line x1="{pad}" y1="{zero_y:.1f}" x2="{pad + inner_w}" y2="{zero_y:.1f}" '
         f'stroke="#475569" stroke-width="0.5" stroke-dasharray="4"/>'
     )
 
-    # Fills
     fill_marks = []
     for f in fills:
         if f.timestamp < ts_min:
@@ -94,7 +84,6 @@ def _pnl_chart_svg(steps: list[SimStep], fills: list[FillEvent],
         color = "#22c55e" if f.side == "SELL" else "#3b82f6"
         fill_marks.append(f'<circle cx="{fx:.1f}" cy="{fy:.1f}" r="3" fill="{color}" opacity="0.7"/>')
 
-    # Etiquetas de eje Y
     labels = []
     for v in [mn, (mn + mx) / 2, mx]:
         y = sy(v)
@@ -102,7 +91,7 @@ def _pnl_chart_svg(steps: list[SimStep], fills: list[FillEvent],
                        f'font-size="9" fill="#94a3b8">{v:+.2f}</text>')
 
     pnl_color = "#22c55e" if pnl_values[-1] >= 0 else "#ef4444"
-    svg = (
+    return (
         f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg" '
         f'style="background:#1e293b;border-radius:6px">'
         f'{zero_line}'
@@ -112,7 +101,6 @@ def _pnl_chart_svg(steps: list[SimStep], fills: list[FillEvent],
         + f'<text x="{pad}" y="{pad - 6}" font-size="10" fill="#94a3b8">P&L Acumulado ($)</text>'
         f'</svg>'
     )
-    return svg
 
 
 # ---------------------------------------------------------------------------
@@ -133,13 +121,13 @@ h1 { font-size: 1.5rem; margin-bottom: 4px; color: #f8fafc; }
 table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
 th { background: #1e293b; color: #64748b; text-align: left; padding: 8px 10px; font-weight: 500; }
 td { padding: 7px 10px; border-bottom: 1px solid #1e293b; vertical-align: middle; }
-tr:hover td { background: #1e293b; }
 .pass { color: #22c55e; font-weight: 600; }
 .fail { color: #ef4444; font-weight: 600; }
 .chart-wrap { background: #1e293b; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
 .market-title { font-size: 0.85rem; color: #94a3b8; margin-bottom: 8px; }
 .reasons { font-size: 0.75rem; color: #ef4444; margin-top: 4px; }
 """
+
 
 def _verdict_card(agg: dict) -> str:
     verdict = agg.get("verdict", "FAIL")
@@ -154,12 +142,7 @@ def generate_report(
     days: int,
     output_path: Path | None = None,
 ) -> Path:
-    """
-    Genera el informe HTML auto-contenido.
-
-    Returns:
-        Path al archivo HTML generado.
-    """
+    """Genera el informe HTML auto-contenido."""
     if output_path is None:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
         output_path = Path(__file__).parent / f"report_{ts}.html"
@@ -167,7 +150,6 @@ def generate_report(
     agg = aggregate_metrics(metrics)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # ---- Summary cards ----
     total_pnl = agg.get("total_pnl_usd", 0.0)
     pnl_pct = total_pnl / max(bankroll, 1) * 100
     pnl_color = "green" if total_pnl >= 0 else "red"
@@ -190,7 +172,6 @@ def generate_report(
     </div>
     """
 
-    # ---- Metrics table ----
     rows = []
     for m in metrics:
         status = '<span class="pass">✅ PASA</span>' if m.passes else '<span class="fail">❌ FALLA</span>'
@@ -198,7 +179,7 @@ def generate_report(
         reasons = ""
         if m.failure_reasons:
             reasons = '<div class="reasons">' + " | ".join(m.failure_reasons) + "</div>"
-        row = f"""
+        rows.append(f"""
         <tr>
           <td>{m.question[:45]}{reasons}</td>
           <td class="{pnl_cls}">${m.pnl_usd:+.4f}</td>
@@ -209,8 +190,7 @@ def generate_report(
           <td>{m.profitable_days_pct:.0f}%</td>
           <td>{m.n_days:.0f}d</td>
           <td>{status}</td>
-        </tr>"""
-        rows.append(row)
+        </tr>""")
 
     table_html = f"""
     <div class="section-title">Resultados por mercado</div>
@@ -223,7 +203,6 @@ def generate_report(
     </table>
     """
 
-    # ---- Charts ----
     charts_html = '<div class="section-title">P&L Acumulado por mercado</div>'
     result_map = {r.condition_id: r for r in results}
     for m in metrics:

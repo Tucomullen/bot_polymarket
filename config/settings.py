@@ -5,7 +5,7 @@ Todas las claves sensibles se leen de .env (nunca hardcodeadas).
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv

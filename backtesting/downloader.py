@@ -87,13 +87,21 @@ async def fetch_top_markets(
 
     valid = []
     for m in markets:
+        # La API puede devolver tokens como lista de objetos o como clobTokenIds (lista de strings)
         tokens = m.get("tokens") or []
-        if len(tokens) < 2:
+        clob_token_ids = m.get("clobTokenIds") or []
+        if isinstance(clob_token_ids, str):
+            import json as _json
+            try:
+                clob_token_ids = _json.loads(clob_token_ids)
+            except Exception:
+                clob_token_ids = []
+        has_tokens = len(tokens) >= 2 or len(clob_token_ids) >= 2
+        if not has_tokens:
             continue
         cid = m.get("conditionId") or m.get("condition_id", "")
         if not cid:
             continue
-        # Solo mercados binarios activos
         if not m.get("active", True):
             continue
         valid.append(m)
@@ -106,12 +114,22 @@ async def fetch_top_markets(
 
 def _extract_token_yes(raw: dict) -> str:
     """Extrae el token ID del outcome YES de un mercado."""
+    # Formato nuevo: clobTokenIds puede ser lista de strings o JSON string
+    clob_ids = raw.get("clobTokenIds") or []
+    if isinstance(clob_ids, str):
+        import json as _json
+        try:
+            clob_ids = _json.loads(clob_ids)
+        except Exception:
+            clob_ids = []
+    if clob_ids:
+        return str(clob_ids[0])
+    # Formato legacy: tokens es lista de objetos con outcome
     tokens = raw.get("tokens") or []
     for t in tokens:
         outcome = str(t.get("outcome", "")).upper()
         if outcome in ("YES", "TRUE", "1"):
             return t.get("token_id") or t.get("tokenId", "")
-    # Fallback: primer token
     if tokens:
         return tokens[0].get("token_id") or tokens[0].get("tokenId", "")
     return ""
@@ -126,28 +144,22 @@ async def fetch_price_history(
     days: int = 30,
     verify_ssl: bool = True,
 ) -> list[PricePoint]:
-    """
-    Descarga el historial de precios por hora para un token YES.
-
-    Usa el endpoint /prices-history de Gamma API con fidelidad de 60 minutos.
-    """
-    end_ts = int(time.time())
-    start_ts = end_ts - days * 86400
-
+    """Descarga el historial de precios por hora para un token YES."""
+    # interval=1m da ~30 días; interval=max da todo el historial disponible
+    # No usamos startTs/endTs porque la API rechaza ventanas fuera del rango del mercado
+    interval = "1m" if days <= 30 else "max"
     params = {
         "market": token_id,
-        "interval": "1d",
-        "fidelity": "60",    # granularidad en minutos
-        "startTs": str(start_ts),
-        "endTs": str(end_ts),
+        "fidelity": "60",
+        "interval": interval,
     }
 
+    clob_host = "https://clob.polymarket.com"
     async with httpx.AsyncClient(timeout=30.0, verify=verify_ssl) as client:
-        resp = await client.get(f"{GAMMA_HOST}/prices-history", params=params)
+        resp = await client.get(f"{clob_host}/prices-history", params=params)
         resp.raise_for_status()
         data = resp.json()
 
-    # Respuesta: {"history": [{"t": ts, "p": "0.52"}, ...]}
     history = data.get("history", data) if isinstance(data, dict) else data
 
     points = []
@@ -203,16 +215,12 @@ async def download_market_history(
     days: int = 30,
     verify_ssl: bool = True,
 ) -> MarketHistory | None:
-    """
-    Descarga el historial completo de un mercado (con caché).
-    Devuelve None si no hay suficientes datos.
-    """
+    """Descarga el historial completo de un mercado (con caché)."""
     condition_id = market_raw.get("conditionId") or market_raw.get("condition_id", "")
     token_id = _extract_token_yes(market_raw)
     question = market_raw.get("question") or market_raw.get("title", condition_id[:16])
     tick_size = float(market_raw.get("orderPriceMinTickSize", 0.01) or 0.01)
 
-    # Rewards info
     rewards = market_raw.get("rewardsMaxSpread") or market_raw.get("rewards", {})
     if isinstance(rewards, dict):
         reward_max_spread = float(rewards.get("maxSpread", 0) or 0)
@@ -225,7 +233,6 @@ async def download_market_history(
         logger.warning("⚠️  Sin token_id_yes para %s", condition_id[:16])
         return None
 
-    # Caché
     cached = _load_cache(condition_id, days)
     if cached:
         logger.info("📦 Caché — %s (%d puntos, %.1f días)",
@@ -256,7 +263,7 @@ async def download_market_history(
         reward_min_size=reward_min_size,
         has_maker_rebates=bool(market_raw.get("makerBaseFee", 0)),
         has_liquidity_rewards=bool(reward_max_spread or reward_min_size),
-        score=50.0,  # placeholder; no es crítico para el backtest
+        score=50.0,
         prices=prices,
     )
 
@@ -266,10 +273,7 @@ async def download_histories(
     days: int = 30,
     verify_ssl: bool = True,
 ) -> list[MarketHistory]:
-    """
-    Descarga los N mercados top + su historial de precios.
-    Punto de entrada principal del downloader.
-    """
+    """Descarga los N mercados top + su historial de precios."""
     top_markets = await fetch_top_markets(n_markets, verify_ssl)
     if not top_markets:
         logger.error("❌ No se encontraron mercados activos")
@@ -286,4 +290,123 @@ async def download_histories(
             logger.warning("⚠️  Error en descarga: %s", r)
 
     logger.info("📊 %d/%d mercados con datos válidos", len(histories), len(top_markets))
+    return histories
+
+
+async def download_histories_with_discovery(
+    n_markets: int = 5,
+    days: int = 30,
+    verify_ssl: bool = True,
+    min_price: float = 0.15,
+    max_price: float = 0.85,
+) -> list[MarketHistory]:
+    """
+    Descarga historiales usando MarketDiscovery para selección de mercados.
+
+    A diferencia de download_histories() (que usa ranking bruto por volumen),
+    esta función aplica el mismo pipeline de 10 factores del bot en live:
+    precio cercano a 0.50, spread razonable, volumen mínimo, incentivos, etc.
+    Garantiza mercados aptos para market making — no directionales.
+
+    min_price/max_price: filtro de precio más estricto que el default del bot (0.03/0.97).
+    Para backtesting se usa 0.15/0.85 para descartar outrights que no oscilan.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+    from src.discovery import MarketDiscovery, DiscoveryConfig
+
+    cfg = DiscoveryConfig(
+        max_active_markets=n_markets,
+        min_price=min_price,
+        max_price=max_price,
+    )
+
+    # Respetar el flag VERIFY_SSL del entorno si no se especifica explícitamente
+    import os
+    if not verify_ssl:
+        os.environ["VERIFY_SSL"] = "false"
+
+    discovery = MarketDiscovery(cfg)
+    try:
+        candidates = await discovery.scan(force=True)
+    finally:
+        await discovery.close()
+
+    if not candidates:
+        logger.error("❌ Discovery no encontró mercados válidos")
+        return []
+
+    logger.info("🎯 Discovery seleccionó %d mercados para backtest", len(candidates))
+    for i, c in enumerate(candidates, 1):
+        logger.info(
+            "   %d. [%.1f] %s — mid=%.2f, spread=%.1f¢, vol=$%.0f",
+            i, c.score, c.question[:55], c.midpoint, c.spread_cents, c.volume_24h,
+        )
+
+    async def _download_candidate(c) -> "MarketHistory | None":
+        if not c.token_id_yes:
+            logger.warning("⚠️  Sin token_id_yes para %s", c.condition_id[:16])
+            return None
+
+        cached = _load_cache(c.condition_id, days)
+        if cached:
+            logger.info(
+                "📦 Caché — %s (%d puntos, %.1f días)",
+                c.question[:40], len(cached),
+                (cached[-1].timestamp - cached[0].timestamp) / 86400 if len(cached) > 1 else 0,
+            )
+            prices = cached
+        else:
+            logger.info(
+                "⬇️  Descargando %dd de historia: %s (score=%.1f)",
+                days, c.question[:40], c.score,
+            )
+            try:
+                prices = await fetch_price_history(c.token_id_yes, days, verify_ssl)
+            except Exception as exc:
+                logger.error("❌ Error descargando %s: %s", c.condition_id[:16], exc)
+                return None
+
+            if len(prices) < 10:
+                logger.warning(
+                    "⚠️  Datos insuficientes (%d puntos) para %s",
+                    len(prices), c.condition_id[:16],
+                )
+                return None
+
+            _save_cache(c.condition_id, days, prices)
+            logger.info("   ✅ %d puntos descargados", len(prices))
+
+        tick_size = 0.01
+        try:
+            tick_size = float(c.tick_size) if c.tick_size else 0.01
+        except (TypeError, ValueError):
+            pass
+
+        return MarketHistory(
+            condition_id=c.condition_id,
+            token_id_yes=c.token_id_yes,
+            question=c.question,
+            tick_size=tick_size,
+            reward_max_spread=c.reward_max_spread,
+            reward_min_size=c.reward_min_size,
+            has_maker_rebates=c.has_maker_rebates,
+            has_liquidity_rewards=c.has_liquidity_rewards,
+            score=c.score,
+            prices=prices,
+        )
+
+    tasks = [_download_candidate(c) for c in candidates]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    histories = []
+    for r in results:
+        if isinstance(r, MarketHistory):
+            histories.append(r)
+        elif isinstance(r, Exception):
+            logger.warning("⚠️  Error en descarga: %s", r)
+
+    logger.info("📊 %d/%d mercados con datos válidos", len(histories), len(candidates))
     return histories

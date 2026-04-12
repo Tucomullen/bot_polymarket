@@ -105,7 +105,6 @@ class TelegramAlerter:
         uptime_h: float,
         n_fills: int = 0,
     ) -> None:
-        emoji = "+" if pnl >= 0 else "-"
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         msg = (
             f"<b>Resumen diario — {today}</b>\n"

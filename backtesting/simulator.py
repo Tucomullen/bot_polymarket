@@ -17,7 +17,6 @@ Limitaciones conocidas:
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 from backtesting.downloader import MarketHistory, PricePoint
 from src.discovery import MarketCandidate, MarketCategory
@@ -37,7 +36,7 @@ class FillEvent:
     """Un fill simulado en el backtest."""
     step: int
     timestamp: float
-    side: str         # "BUY" o "SELL"
+    side: str
     price: float
     size: float
     size_usd: float
@@ -52,8 +51,8 @@ class SimStep:
     mid_price: float
     our_bid: float
     our_ask: float
-    position_yes: float     # Shares YES en cartera
-    position_usd: float     # Valor de la posición en USD
+    position_yes: float
+    position_usd: float
     cumulative_pnl: float
     drawdown: float
 
@@ -69,8 +68,8 @@ class BacktestResult:
     n_sell_fills: int = 0
     total_volume_usd: float = 0.0
     final_pnl: float = 0.0
-    max_drawdown: float = 0.0        # En USD (negativo)
-    max_drawdown_pct: float = 0.0    # En % del bankroll inicial
+    max_drawdown: float = 0.0
+    max_drawdown_pct: float = 0.0
     peak_pnl: float = 0.0
     bankroll_initial: float = 0.0
     fills: list[FillEvent] = field(default_factory=list)
@@ -78,7 +77,6 @@ class BacktestResult:
 
     @property
     def fill_rate(self) -> float:
-        """% de pasos donde hubo al menos un fill."""
         return self.n_fills / max(self.n_steps, 1) * 100
 
     @property
@@ -87,14 +85,11 @@ class BacktestResult:
 
 
 # ---------------------------------------------------------------------------
-# Simulador
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _make_candidate(history: MarketHistory, price: float) -> MarketCandidate:
-    """
-    Construye un MarketCandidate sintético con el precio actual.
-    Se usa en cada paso de tiempo para que QuotingEngine pueda cotizar.
-    """
+    """Construye un MarketCandidate sintético con el precio actual."""
     tick = history.tick_size
     half_tick = tick / 2.0
     best_bid = max(tick, round(price - half_tick, 4))
@@ -121,10 +116,7 @@ def _make_candidate(history: MarketHistory, price: float) -> MarketCandidate:
 
 
 def _inject_book(tracker: OrderbookTracker, token_id: str, price: float, tick: float) -> None:
-    """
-    Inyecta un orderbook sintético basado en el precio histórico.
-    El spread sintético es de 2 ticks para simular liquidez.
-    """
+    """Inyecta un orderbook sintético basado en el precio histórico."""
     spread = tick * 2
     bid = max(tick, price - spread / 2)
     ask = min(1.0 - tick, price + spread / 2)
@@ -135,24 +127,17 @@ def _inject_book(tracker: OrderbookTracker, token_id: str, price: float, tick: f
     })
 
 
+# ---------------------------------------------------------------------------
+# Simulador principal
+# ---------------------------------------------------------------------------
+
 def simulate_market(
     history: MarketHistory,
     bankroll_usd: float = 1000.0,
     quoting_cfg: QuotingConfig | None = None,
     risk_manager: RiskManager | None = None,
 ) -> BacktestResult:
-    """
-    Simula la estrategia de market making sobre el historial de un mercado.
-
-    Args:
-        history: historial de precios descargado
-        bankroll_usd: capital inicial simulado
-        quoting_cfg: config del motor de cotización (usa defaults si es None)
-        risk_manager: gestor de riesgo (se crea uno con defaults si es None)
-
-    Returns:
-        BacktestResult con todos los fills, steps y métricas brutas
-    """
+    """Simula la estrategia de market making sobre el historial de un mercado."""
     prices = history.prices
     if len(prices) < 2:
         logger.warning("⚠️  Datos insuficientes para %s (%d puntos)", history.condition_id[:16], len(prices))
@@ -168,7 +153,7 @@ def simulate_market(
             kelly_fraction=0.25,
             max_order_risk_pct=0.05,
             max_total_exposure_pct=0.20,
-            max_session_loss_pct=0.10,   # más permisivo para no cortar el backtest
+            max_session_loss_pct=0.10,
             max_consecutive_errors=999,
         )
 
@@ -182,9 +167,8 @@ def simulate_market(
         bankroll_initial=bankroll_usd,
     )
 
-    # Estado de posición durante la simulación
-    position_yes: float = 0.0       # shares YES en cartera
-    avg_entry_price: float = 0.0    # precio medio de entrada
+    position_yes: float = 0.0
+    avg_entry_price: float = 0.0
     cumulative_pnl: float = 0.0
     peak_pnl: float = 0.0
     max_drawdown: float = 0.0
@@ -193,13 +177,9 @@ def simulate_market(
         current = prices[i]
         next_pt = prices[i + 1]
 
-        # Inyectar precio actual en el orderbook sintético
         _inject_book(orderbook, history.token_id_yes, current.price, history.tick_size)
-
-        # Construir MarketCandidate con el precio actual
         candidate = _make_candidate(history, current.price)
 
-        # Generar cotizaciones
         pair = engine.generate_quotes(
             candidate,
             inventory_yes=position_yes,
@@ -212,80 +192,56 @@ def simulate_market(
 
         our_bid = pair.bid.price
         our_ask = pair.ask.price
-        size_usd = pair.bid.size_usd  # mismo size_usd para bid y ask
+        size_usd = pair.bid.size_usd
         result.n_steps += 1
 
-        # --- Simulación de fills ---
-        # BUY fill: el precio bajó hasta nuestro bid (alguien nos vende)
+        # BUY fill: el precio bajó hasta nuestro bid
         if next_pt.price <= our_bid and size_usd > 0:
             shares_bought = size_usd / our_bid
-
-            # Actualizar posición y precio medio
             total_cost = avg_entry_price * position_yes + our_bid * shares_bought
             position_yes += shares_bought
             avg_entry_price = total_cost / position_yes if position_yes > 0 else 0.0
-
             risk_manager.record_fill(history.condition_id, "BUY", our_bid, shares_bought)
-
-            fill = FillEvent(
-                step=i,
-                timestamp=current.timestamp,
-                side="BUY",
-                price=our_bid,
-                size=shares_bought,
-                size_usd=size_usd,
-            )
-            result.fills.append(fill)
+            result.fills.append(FillEvent(
+                step=i, timestamp=current.timestamp, side="BUY",
+                price=our_bid, size=shares_bought, size_usd=size_usd,
+            ))
             result.n_buy_fills += 1
             result.total_volume_usd += size_usd
 
-        # SELL fill: el precio subió hasta nuestro ask (alguien nos compra)
+        # SELL fill: el precio subió hasta nuestro ask
         if next_pt.price >= our_ask and position_yes > 0 and size_usd > 0:
             shares_sold = min(size_usd / our_ask, position_yes)
             pnl = (our_ask - avg_entry_price) * shares_sold
             cumulative_pnl += pnl
-
             risk_manager.record_fill(history.condition_id, "SELL", our_ask, shares_sold)
-
             position_yes = max(0.0, position_yes - shares_sold)
             if position_yes == 0:
                 avg_entry_price = 0.0
 
-            fill = FillEvent(
-                step=i,
-                timestamp=current.timestamp,
-                side="SELL",
-                price=our_ask,
-                size=shares_sold,
-                size_usd=shares_sold * our_ask,
-                pnl_this_fill=pnl,
-            )
-            result.fills.append(fill)
+            result.fills.append(FillEvent(
+                step=i, timestamp=current.timestamp, side="SELL",
+                price=our_ask, size=shares_sold,
+                size_usd=shares_sold * our_ask, pnl_this_fill=pnl,
+            ))
             result.n_sell_fills += 1
             result.total_volume_usd += shares_sold * our_ask
 
-            # Actualizar drawdown
             if cumulative_pnl > peak_pnl:
                 peak_pnl = cumulative_pnl
             drawdown = cumulative_pnl - peak_pnl
             if drawdown < max_drawdown:
                 max_drawdown = drawdown
 
-        # Registrar estado del step
         position_usd = position_yes * current.price
         result.steps.append(SimStep(
-            step=i,
-            timestamp=current.timestamp,
-            mid_price=current.price,
-            our_bid=our_bid,
-            our_ask=our_ask,
-            position_yes=position_yes,
-            position_usd=position_usd,
-            cumulative_pnl=cumulative_pnl,
+            step=i, timestamp=current.timestamp, mid_price=current.price,
+            our_bid=our_bid, our_ask=our_ask, position_yes=position_yes,
+            position_usd=position_usd, cumulative_pnl=cumulative_pnl,
             drawdown=cumulative_pnl - peak_pnl,
         ))
 
-    # Liquidar posición final al último precio (mark-to-market)
+    # Liquidar posición final (mark-to-market)
     if position_yes > 0 and prices:
         last_price = prices[-1].price
         mark_pnl = (last_price - avg_entry_price) * position_yes
@@ -301,13 +257,8 @@ def simulate_market(
 
     logger.info(
         "✅ %s | steps=%d fills=%d(B:%d/S:%d) PnL=%.4f DD=%.1f%%",
-        history.question[:35],
-        result.n_steps,
-        result.n_fills,
-        result.n_buy_fills,
-        result.n_sell_fills,
-        result.final_pnl,
-        result.max_drawdown_pct,
+        history.question[:35], result.n_steps, result.n_fills,
+        result.n_buy_fills, result.n_sell_fills, result.final_pnl, result.max_drawdown_pct,
     )
     return result
 
@@ -317,17 +268,10 @@ def run_backtest(
     bankroll_usd: float = 1000.0,
     quoting_cfg: QuotingConfig | None = None,
 ) -> list[BacktestResult]:
-    """
-    Ejecuta el backtest sobre todos los mercados descargados.
-    Cada mercado usa su propio RiskManager independiente.
-    """
+    """Ejecuta el backtest sobre todos los mercados descargados."""
     results = []
     for history in histories:
         logger.info("🔄 Simulando: %s", history.question[:50])
-        result = simulate_market(
-            history,
-            bankroll_usd=bankroll_usd,
-            quoting_cfg=quoting_cfg,
-        )
+        result = simulate_market(history, bankroll_usd=bankroll_usd, quoting_cfg=quoting_cfg)
         results.append(result)
     return results

@@ -15,11 +15,12 @@ Principios:
 """
 
 import logging
+import math
 import time
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from src.orderbook import OrderbookTracker, OrderbookState
+from src.orderbook import OrderbookTracker
 from src.discovery import MarketCandidate
 
 if TYPE_CHECKING:
@@ -153,7 +154,6 @@ class QuotingEngine:
         """
         # 1. Obtener estado del orderbook
         book_yes = self._orderbook.get(market.token_id_yes)
-        book_no = self._orderbook.get(market.token_id_no)
 
         # Usar datos del book si están frescos, sino los del discovery
         if book_yes and book_yes.last_update > 0 and book_yes.best_bid > 0:
@@ -293,11 +293,6 @@ class QuotingEngine:
     ) -> float:
         """
         Calcula el half-spread dinámico (mitad del spread total).
-        Se ajusta según:
-          - Spread base configurado
-          - Volatilidad del mercado
-          - Categoría del mercado
-          - Spread de rewards (si hay, queremos estar dentro)
         """
         half = self.cfg.base_spread_cents / 100.0 / 2.0
 
@@ -318,12 +313,6 @@ class QuotingEngine:
     ) -> float:
         """
         Calcula el desplazamiento (skew) del midpoint según inventario.
-
-        Si tenemos mucho YES, queremos vender YES → bajamos el ask (desplazamos mid hacia abajo)
-        Si tenemos mucho NO, queremos vender NO → subimos el bid (desplazamos mid hacia arriba)
-
-        Returns:
-            skew en unidades de precio (ej. -0.005 = desplazar mid 0.5¢ abajo)
         """
         if self.cfg.inventory_skew_factor == 0:
             return 0.0
@@ -350,9 +339,6 @@ class QuotingEngine:
     ) -> float:
         """
         Calcula el tamaño de la orden en USD.
-
-        Si se proporciona risk_manager, usa Kelly fraccional para el sizing.
-        Si no, usa la lógica legacy con cap fijo del 5% del bankroll.
         """
         if risk_manager is not None:
             # Kelly fraccional: el risk_manager considera exposición total y Kelly
@@ -388,7 +374,6 @@ class QuotingEngine:
         if direction == "down":
             return (int(price / tick)) * tick
         elif direction == "up":
-            import math
             return math.ceil(price / tick) * tick
         else:
             return round(price / tick) * tick

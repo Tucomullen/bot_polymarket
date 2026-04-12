@@ -12,16 +12,6 @@ Endpoints:
   GET  /api/stream    -> SSE: actualizaciones en tiempo real (1/s)
   POST /api/kill-switch -> activa el kill switch manualmente
   GET  /api/logs      -> ultimas N lineas de log
-
-Integracion:
-  Crea un BotState y lo actualiza desde main.py pasando referencias
-  al RiskManager y TradingLoop.
-
-  from src.dashboard import DashboardServer, BotState
-  state = BotState()
-  dashboard = DashboardServer(state, port=8080)
-  await dashboard.start()           # lanza uvicorn en background
-  state.wire(risk_manager, trading_loop)
 """
 
 import asyncio
@@ -44,12 +34,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("polybot.dashboard")
 
-# ---------------------------------------------------------------------------
-# BotState — estado compartido entre el bot y el dashboard
-# ---------------------------------------------------------------------------
-
-MAX_EVENTS = 50    # ultimas N ordenes/fills en el buffer
-MAX_LOGS = 200     # ultimas N lineas de log en memoria
+MAX_EVENTS = 50
+MAX_LOGS = 200
 
 
 @dataclass
@@ -63,12 +49,7 @@ class MarketQuoteSnapshot:
 
 
 class BotState:
-    """
-    Estado centralizado del bot accesible desde el dashboard.
-
-    El objeto vive en main.py y se pasa al DashboardServer. El trading loop
-    lo actualiza via wire() + push_event(). El dashboard solo lee.
-    """
+    """Estado centralizado del bot accesible desde el dashboard."""
 
     def __init__(self) -> None:
         self._risk: "RiskManager | None" = None
@@ -78,11 +59,8 @@ class BotState:
         self._bankroll: float = 0.0
         self._kill_triggered_notified: bool = False
 
-        # Buffers de eventos y logs (thread-safe con deque)
         self.events: collections.deque[dict] = collections.deque(maxlen=MAX_EVENTS)
         self.log_lines: collections.deque[str] = collections.deque(maxlen=MAX_LOGS)
-
-        # Quotes activas por mercado
         self.market_quotes: dict[str, MarketQuoteSnapshot] = {}
 
     def wire(
@@ -92,24 +70,20 @@ class BotState:
         simulation: bool = True,
         bankroll: float = 0.0,
     ) -> None:
-        """Conecta el estado con los componentes del bot."""
         self._risk = risk_manager
         self._loop = trading_loop
         self._simulation = simulation
         self._bankroll = bankroll
 
     def push_event(self, event: dict) -> None:
-        """Registra un evento de orden/fill en el buffer circular."""
         event.setdefault("ts", datetime.now(timezone.utc).strftime("%H:%M:%S"))
         self.events.appendleft(event)
 
     def push_log(self, line: str) -> None:
-        """Registra una linea de log en el buffer circular."""
         self.log_lines.appendleft(line)
 
     def update_quote(self, condition_id: str, question: str,
                      bid: float, ask: float, mid: float) -> None:
-        """Actualiza la quote activa de un mercado."""
         self.market_quotes[condition_id] = MarketQuoteSnapshot(
             condition_id=condition_id,
             question=question[:50],
@@ -120,7 +94,6 @@ class BotState:
         )
 
     def snapshot(self) -> dict:
-        """Devuelve un snapshot JSON del estado actual para el SSE stream."""
         risk_stats = self._risk.get_stats() if self._risk else {}
         loop_running = self._loop.is_running if self._loop else False
         cycle_count = self._loop.cycle_count if self._loop else 0
@@ -128,7 +101,6 @@ class BotState:
 
         uptime_s = time.time() - self._started_at
         uptime_str = _format_uptime(uptime_s)
-
         kill_active = risk_stats.get("kill_switch", False)
 
         return {
@@ -169,16 +141,8 @@ def _format_uptime(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
-# ---------------------------------------------------------------------------
-# Log handler — escribe JSON lines a disco + alimenta el buffer del dashboard
-# ---------------------------------------------------------------------------
-
 class DashboardLogHandler(logging.Handler):
-    """
-    Handler de logging que:
-    1. Guarda el buffer en memoria para el endpoint /api/logs
-    2. (Opcional) Escribe JSON lines a disco si se configura log_dir
-    """
+    """Handler que alimenta el buffer de logs del dashboard."""
 
     def __init__(self, bot_state: BotState, log_dir: str = "") -> None:
         super().__init__()
@@ -213,18 +177,8 @@ class DashboardLogHandler(logging.Handler):
             self._file.close()
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-
 def create_app(state: BotState, password: str = "") -> FastAPI:
-    """
-    Crea la aplicacion FastAPI con todos los endpoints.
-
-    Args:
-        state: estado compartido del bot
-        password: si se configura, el endpoint /api/kill-switch lo requiere
-    """
+    """Crea la aplicacion FastAPI con todos los endpoints."""
     app = FastAPI(title="Polymarket Bot Dashboard", docs_url=None, redoc_url=None)
     app.add_middleware(
         CORSMiddleware,
@@ -233,25 +187,13 @@ def create_app(state: BotState, password: str = "") -> FastAPI:
         allow_headers=["*"],
     )
 
-    # ------------------------------------------------------------------
-    # GET / — Dashboard HTML
-    # ------------------------------------------------------------------
-
     @app.get("/", response_class=HTMLResponse)
     async def dashboard() -> HTMLResponse:
         return HTMLResponse(_HTML)
 
-    # ------------------------------------------------------------------
-    # GET /api/status — Snapshot JSON
-    # ------------------------------------------------------------------
-
     @app.get("/api/status")
     async def status() -> JSONResponse:
         return JSONResponse(state.snapshot())
-
-    # ------------------------------------------------------------------
-    # GET /api/stream — SSE stream (1 evento/segundo)
-    # ------------------------------------------------------------------
 
     @app.get("/api/stream")
     async def stream() -> StreamingResponse:
@@ -264,32 +206,19 @@ def create_app(state: BotState, password: str = "") -> FastAPI:
         return StreamingResponse(
             event_generator(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-
-    # ------------------------------------------------------------------
-    # POST /api/kill-switch — Activa kill switch manualmente
-    # ------------------------------------------------------------------
 
     @app.post("/api/kill-switch")
     async def kill_switch(body: dict = {}) -> JSONResponse:
         if password and body.get("password") != password:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-
         if state._risk is None:
             return JSONResponse({"error": "risk_manager not available"}, status_code=503)
-
         reason = body.get("reason", "activado manualmente desde el dashboard")
         state._risk._trigger(reason)
         logger.warning("Kill switch activado desde el dashboard: %s", reason)
         return JSONResponse({"ok": True, "reason": reason})
-
-    # ------------------------------------------------------------------
-    # GET /api/logs — Ultimas N lineas de log
-    # ------------------------------------------------------------------
 
     @app.get("/api/logs")
     async def logs(n: int = 100) -> JSONResponse:
@@ -299,18 +228,8 @@ def create_app(state: BotState, password: str = "") -> FastAPI:
     return app
 
 
-# ---------------------------------------------------------------------------
-# DashboardServer — wrapper para arrancar uvicorn como tarea asyncio
-# ---------------------------------------------------------------------------
-
 class DashboardServer:
-    """
-    Arranca el dashboard FastAPI en background como tarea asyncio.
-
-    Uso:
-        server = DashboardServer(state, port=8080)
-        task = asyncio.create_task(server.start())
-    """
+    """Arranca el dashboard FastAPI en background como tarea asyncio."""
 
     def __init__(
         self,
@@ -325,23 +244,18 @@ class DashboardServer:
         self._app = create_app(state, password)
 
     async def start(self) -> None:
-        """Arranca uvicorn en el event loop actual."""
         import uvicorn
         config = uvicorn.Config(
             app=self._app,
             host=self._host,
             port=self._port,
-            log_level="warning",   # uvicorn silencioso para no saturar logs del bot
+            log_level="warning",
             access_log=False,
         )
         server = uvicorn.Server(config)
         logger.info("Dashboard disponible en http://%s:%d", self._host, self._port)
         await server.serve()
 
-
-# ---------------------------------------------------------------------------
-# HTML del dashboard (inline)
-# ---------------------------------------------------------------------------
 
 _HTML = """<!DOCTYPE html>
 <html lang="es">
@@ -386,9 +300,7 @@ td{padding:6px 10px;border-bottom:1px solid #0f172a}
   <button class="kill-btn" id="killBtn" onclick="activateKillSwitch()">KILL SWITCH</button>
 </h1>
 <div class="subtitle" id="subtitle">Conectando...</div>
-
 <div id="killBanner" class="kill-banner">KILL SWITCH ACTIVO — Todas las ordenes canceladas. Revision manual requerida.</div>
-
 <div class="grid">
   <div class="card"><div class="card-label">Uptime</div><div class="card-value" id="uptime">—</div></div>
   <div class="card"><div class="card-label">P&L Sesion</div><div class="card-value" id="pnl">—</div></div>
@@ -397,146 +309,78 @@ td{padding:6px 10px;border-bottom:1px solid #0f172a}
   <div class="card"><div class="card-label">Fills</div><div class="card-value blue" id="fills">—</div></div>
   <div class="card"><div class="card-label">Errores</div><div class="card-value" id="errors">—</div></div>
 </div>
-
 <div class="section">Mercados activos</div>
 <table id="marketsTable">
   <thead><tr><th>Mercado</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Mid</th></tr></thead>
   <tbody id="marketsBody"><tr><td colspan="5" style="color:#475569">Esperando datos...</td></tr></tbody>
 </table>
-
 <div class="section">Actividad reciente</div>
 <table id="eventsTable">
   <thead><tr><th>Hora</th><th>Tipo</th><th>Lado</th><th>Precio</th><th>Mercado</th></tr></thead>
   <tbody id="eventsBody"><tr><td colspan="5" style="color:#475569">Sin actividad</td></tr></tbody>
 </table>
-
 <div class="section">Logs recientes</div>
 <div class="logs" id="logsDiv">Esperando logs...</div>
-
 <script>
 const $ = id => document.getElementById(id);
-
-function pnlColor(v) {
-  if (v > 0) return 'green';
-  if (v < 0) return 'red';
-  return 'gray';
+function pnlColor(v){if(v>0)return'green';if(v<0)return'red';return'gray';}
+function update(d){
+  const dot=$('dot');
+  if(d.kill_switch){dot.className='status-dot dot-red';$('killBanner').style.display='block';$('killBtn').disabled=true;}
+  else if(d.loop_running){dot.className='status-dot dot-green';$('killBanner').style.display='none';$('killBtn').disabled=false;}
+  else{dot.className='status-dot dot-gray';}
+  const mode=d.simulation?'[SIM]':'[LIVE]';
+  $('subtitle').textContent=`${mode} — ${d.ts}`;
+  $('uptime').textContent=d.uptime;
+  const pnl=d.session_pnl||0;
+  const pnlEl=$('pnl');
+  pnlEl.textContent=(pnl>=0?'+':'')+pnl.toFixed(4)+' $';
+  pnlEl.className='card-value '+pnlColor(pnl);
+  $('exposure').textContent=(d.exposure_pct||0).toFixed(1)+'% ($'+(d.exposure_usd||0).toFixed(0)+')';
+  $('cycles').textContent=(d.cycle_count||0).toLocaleString();
+  $('fills').textContent=(d.fills||0);
+  const errEl=$('errors');
+  errEl.textContent=d.consecutive_errors||0;
+  errEl.className='card-value '+(d.consecutive_errors>0?'red':'green');
+  const mb=$('marketsBody');
+  if(d.markets&&d.markets.length>0){
+    mb.innerHTML=d.markets.map(m=>`<tr><td title="${m.cid}">${m.question}</td><td class="green">${m.bid.toFixed(3)}</td><td class="red">${m.ask.toFixed(3)}</td><td class="yellow">${m.spread.toFixed(1)}c</td><td>${m.mid.toFixed(3)}</td></tr>`).join('');
+  }else{mb.innerHTML='<tr><td colspan="5" style="color:#475569">Sin mercados activos</td></tr>';}
+  const eb=$('eventsBody');
+  if(d.events&&d.events.length>0){
+    eb.innerHTML=d.events.slice(0,20).map(e=>`<tr><td class="gray">${e.ts||''}</td><td><span class="pill pill-${(e.type||'').toLowerCase()}">${e.type||'?'}</span>${e.simulation?' <span class="pill pill-sim">SIM</span>':''}</td><td class="${e.side==='BUY'?'blue':'green'}">${e.side||''}</td><td>${e.price?parseFloat(e.price).toFixed(3):''}</td><td style="color:#64748b" title="${e.condition_id||''}">${(e.question||e.condition_id||'').substring(0,30)}</td></tr>`).join('');
+  }else{eb.innerHTML='<tr><td colspan="5" style="color:#475569">Sin actividad</td></tr>';}
 }
-
-function update(d) {
-  // Status dot
-  const dot = $('dot');
-  if (d.kill_switch) {
-    dot.className = 'status-dot dot-red';
-    $('killBanner').style.display = 'block';
-    $('killBtn').disabled = true;
-  } else if (d.loop_running) {
-    dot.className = 'status-dot dot-green';
-    $('killBanner').style.display = 'none';
-    $('killBtn').disabled = false;
-  } else {
-    dot.className = 'status-dot dot-gray';
-  }
-
-  const mode = d.simulation ? '[SIM]' : '[LIVE]';
-  $('subtitle').textContent = `${mode} — ${d.ts}`;
-  $('uptime').textContent = d.uptime;
-
-  const pnl = d.session_pnl || 0;
-  const pnlEl = $('pnl');
-  pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' $';
-  pnlEl.className = 'card-value ' + pnlColor(pnl);
-
-  $('exposure').textContent = (d.exposure_pct || 0).toFixed(1) + '% ($' + (d.exposure_usd || 0).toFixed(0) + ')';
-  $('cycles').textContent = (d.cycle_count || 0).toLocaleString();
-  $('fills').textContent = (d.fills || 0);
-
-  const errEl = $('errors');
-  errEl.textContent = d.consecutive_errors || 0;
-  errEl.className = 'card-value ' + (d.consecutive_errors > 0 ? 'red' : 'green');
-
-  // Markets table
-  const mb = $('marketsBody');
-  if (d.markets && d.markets.length > 0) {
-    mb.innerHTML = d.markets.map(m =>
-      `<tr>
-        <td title="${m.cid}">${m.question}</td>
-        <td class="green">${m.bid.toFixed(3)}</td>
-        <td class="red">${m.ask.toFixed(3)}</td>
-        <td class="yellow">${m.spread.toFixed(1)}c</td>
-        <td>${m.mid.toFixed(3)}</td>
-      </tr>`
-    ).join('');
-  } else {
-    mb.innerHTML = '<tr><td colspan="5" style="color:#475569">Sin mercados activos</td></tr>';
-  }
-
-  // Events table
-  const eb = $('eventsBody');
-  if (d.events && d.events.length > 0) {
-    eb.innerHTML = d.events.slice(0, 20).map(e =>
-      `<tr>
-        <td class="gray">${e.ts || ''}</td>
-        <td><span class="pill pill-${(e.type||'').toLowerCase()}">${e.type || '?'}</span>${e.simulation ? ' <span class="pill pill-sim">SIM</span>' : ''}</td>
-        <td class="${e.side === 'BUY' ? 'blue' : 'green'}">${e.side || ''}</td>
-        <td>${e.price ? parseFloat(e.price).toFixed(3) : ''}</td>
-        <td style="color:#64748b" title="${e.condition_id || ''}">${(e.question || e.condition_id || '').substring(0,30)}</td>
-      </tr>`
-    ).join('');
-  } else {
-    eb.innerHTML = '<tr><td colspan="5" style="color:#475569">Sin actividad</td></tr>';
-  }
-}
-
-function updateLogs(lines) {
-  const el = $('logsDiv');
-  el.innerHTML = lines.slice(0, 60).map(l => {
-    let cls = 'log-info';
-    if (l.includes('ERROR') || l.includes('CRITICAL') || l.includes('💥')) cls = 'log-error';
-    else if (l.includes('WARNING') || l.includes('WARN') || l.includes('⚠')) cls = 'log-warn';
-    return `<div class="${cls}">${escHtml(l)}</div>`;
+function updateLogs(lines){
+  const el=$('logsDiv');
+  el.innerHTML=lines.slice(0,60).map(l=>{
+    let cls='log-info';
+    if(l.includes('ERROR')||l.includes('CRITICAL')||l.includes('💥'))cls='log-error';
+    else if(l.includes('WARNING')||l.includes('WARN')||l.includes('⚠'))cls='log-warn';
+    return`<div class="${cls}">${escHtml(l)}</div>`;
   }).join('');
 }
-
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+async function activateKillSwitch(){
+  if(!confirm('Activar KILL SWITCH? Esto cancelara todas las ordenes abiertas.'))return;
+  try{
+    const r=await fetch('/api/kill-switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'activado manualmente'})});
+    const d=await r.json();
+    if(d.ok)alert('Kill switch activado correctamente.');
+    else alert('Error: '+JSON.stringify(d));
+  }catch(e){alert('Error de red: '+e);}
 }
-
-async function activateKillSwitch() {
-  if (!confirm('Activar KILL SWITCH? Esto cancelara todas las ordenes abiertas.')) return;
-  try {
-    const r = await fetch('/api/kill-switch', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({reason:'activado manualmente'})});
-    const d = await r.json();
-    if (d.ok) alert('Kill switch activado correctamente.');
-    else alert('Error: ' + JSON.stringify(d));
-  } catch(e) { alert('Error de red: ' + e); }
+function connectSSE(){
+  const es=new EventSource('/api/stream');
+  es.onmessage=e=>{try{update(JSON.parse(e.data));}catch(_){}};
+  es.onerror=()=>{$('dot').className='status-dot dot-gray';$('subtitle').textContent='Reconectando...';setTimeout(connectSSE,3000);es.close();};
 }
-
-// SSE stream
-function connectSSE() {
-  const es = new EventSource('/api/stream');
-  es.onmessage = e => {
-    try { update(JSON.parse(e.data)); } catch(_) {}
-  };
-  es.onerror = () => {
-    $('dot').className = 'status-dot dot-gray';
-    $('subtitle').textContent = 'Reconectando...';
-    setTimeout(connectSSE, 3000);
-    es.close();
-  };
+async function fetchLogs(){
+  try{const r=await fetch('/api/logs?n=60');const d=await r.json();updateLogs(d.lines||[]);}catch(_){}
 }
-
-// Logs: fetch cada 3 segundos
-async function fetchLogs() {
-  try {
-    const r = await fetch('/api/logs?n=60');
-    const d = await r.json();
-    updateLogs(d.lines || []);
-  } catch(_) {}
-}
-
 connectSSE();
 fetchLogs();
-setInterval(fetchLogs, 3000);
+setInterval(fetchLogs,3000);
 </script>
 </body>
 </html>"""

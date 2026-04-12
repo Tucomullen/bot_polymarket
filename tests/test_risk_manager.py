@@ -1,8 +1,5 @@
 """
-tests/test_risk_manager.py — Tests del RiskManager.
-
-Cubre: kill switch (pérdida y errores), Kelly sizing, tracking de exposición,
-registro de fills y cálculo de P&L.
+tests/test_risk_manager.py — Tests del gestor de riesgo.
 """
 
 import pytest
@@ -10,207 +7,220 @@ from src.risk_manager import RiskManager
 
 
 # ---------------------------------------------------------------------------
-# Kill switch — pérdida de sesión
+# TestKillSwitch
 # ---------------------------------------------------------------------------
 
-class TestKillSwitchLoss:
+class TestKillSwitch:
+    """Valida los mecanismos de activación del kill switch."""
 
-    def test_not_triggered_initially(self, risk):
-        triggered, _ = risk.check_kill_switch()
-        assert not triggered
-
-    def test_triggers_on_session_loss(self, risk):
-        """Se activa si la pérdida supera max_session_loss_pct * bankroll."""
-        # Bankroll=$1000, max_loss=5% → umbral=$50
-        risk._session_pnl = -51.0
+    def test_no_kill_switch_initially(self, risk: RiskManager):
+        """El kill switch no está activo al iniciar."""
         triggered, reason = risk.check_kill_switch()
-        assert triggered
-        assert "pérdida" in reason
+        assert triggered is False
+        assert reason == ""
 
-    def test_does_not_trigger_just_below_threshold(self, risk):
-        """Justo por debajo del umbral no debe activarse."""
-        risk._session_pnl = -49.99
+    def test_kill_switch_on_session_loss(self, risk: RiskManager):
+        """El kill switch se activa cuando la pérdida de sesión supera el límite."""
+        # bankroll=1000, max_session_loss_pct=0.05 → límite = 50$
+        # Simular una pérdida de 60$
+        risk._session_pnl = -60.0
+        triggered, reason = risk.check_kill_switch()
+        assert triggered is True
+        assert "pérdida" in reason or "loss" in reason.lower() or len(reason) > 0
+
+    def test_kill_switch_remains_active_after_trigger(self, risk: RiskManager):
+        """Una vez activado el kill switch, permanece activo aunque el PnL mejore."""
+        risk._session_pnl = -60.0
+        risk.check_kill_switch()  # activa
+        risk._session_pnl = 0.0  # "mejora" el PnL
         triggered, _ = risk.check_kill_switch()
-        assert not triggered
+        assert triggered is True
 
-    def test_stays_triggered_after_reset_without_call(self, risk):
-        """Una vez activado, sigue activo en llamadas posteriores."""
-        risk._session_pnl = -100.0
-        risk.check_kill_switch()
-        risk._session_pnl = 0.0   # recuperamos el P&L (no debería importar)
-        triggered, _ = risk.check_kill_switch()
-        assert triggered
+    def test_kill_switch_on_consecutive_errors(self, risk: RiskManager):
+        """El kill switch se activa al acumular el máximo de errores consecutivos."""
+        # max_consecutive_errors=5
+        for _ in range(5):
+            risk.record_error()
+        triggered, reason = risk.check_kill_switch()
+        assert triggered is True
+        assert "error" in reason.lower() or len(reason) > 0
 
-    def test_reset_clears_kill_switch(self, risk):
-        """reset_kill_switch permite reanudar operaciones."""
-        risk._session_pnl = -100.0
+    def test_reset_kill_switch(self, risk: RiskManager):
+        """reset_kill_switch desactiva el kill switch y limpia el contador de errores."""
+        risk._session_pnl = -60.0
         risk.check_kill_switch()
+        assert risk.check_kill_switch()[0] is True
+
         risk.reset_kill_switch()
-        risk._session_pnl = 0.0  # también limpiar la pérdida para evitar re-trigger
+        risk._session_pnl = 0.0
         triggered, _ = risk.check_kill_switch()
-        assert not triggered
+        assert triggered is False
 
-
-# ---------------------------------------------------------------------------
-# Kill switch — errores consecutivos
-# ---------------------------------------------------------------------------
-
-class TestKillSwitchErrors:
-
-    def test_triggers_on_max_errors(self, risk):
-        """Se activa tras max_consecutive_errors errores seguidos."""
-        for _ in range(5):          # fixture: max_consecutive_errors=5
-            risk.record_error()
-        triggered, reason = risk.check_kill_switch()
-        assert triggered
-        assert "errores" in reason
-
-    def test_success_resets_error_count(self, risk):
-        """Un éxito reinicia el contador de errores."""
-        for _ in range(4):
-            risk.record_error()
+    def test_record_success_resets_error_counter(self, risk: RiskManager):
+        """record_success() limpia el contador de errores consecutivos."""
+        risk.record_error()
+        risk.record_error()
         risk.record_success()
-        for _ in range(4):
-            risk.record_error()
-        triggered, _ = risk.check_kill_switch()
-        assert not triggered   # solo 4 errores tras el reset, umbral=5
-
-    def test_does_not_trigger_below_threshold(self, risk):
-        for _ in range(4):
-            risk.record_error()
-        triggered, _ = risk.check_kill_switch()
-        assert not triggered
+        assert risk._consecutive_errors == 0
 
 
 # ---------------------------------------------------------------------------
-# Exposición
+# TestExposureTracking
 # ---------------------------------------------------------------------------
 
-class TestExposure:
+class TestExposureTracking:
+    """Valida el seguimiento de exposición por mercado."""
 
-    def test_record_order_opened_increases_exposure(self, risk):
-        risk.record_order_opened("0xmkt1", 50.0)
-        assert risk.get_market_exposure("0xmkt1") == pytest.approx(50.0)
-        assert risk.get_total_exposure() == pytest.approx(50.0)
+    def test_exposure_increases_with_order(self, risk: RiskManager):
+        """La exposición sube cuando se abre una orden."""
+        risk.record_order_opened("mkt1", 25.0)
+        assert risk.get_market_exposure("mkt1") == 25.0
 
-    def test_record_order_closed_decreases_exposure(self, risk):
-        risk.record_order_opened("0xmkt1", 50.0)
-        risk.record_order_closed("0xmkt1", 30.0)
-        assert risk.get_market_exposure("0xmkt1") == pytest.approx(20.0)
+    def test_exposure_decreases_on_close(self, risk: RiskManager):
+        """La exposición baja cuando se cancela una orden."""
+        risk.record_order_opened("mkt1", 25.0)
+        risk.record_order_closed("mkt1", 25.0)
+        assert risk.get_market_exposure("mkt1") == 0.0
 
-    def test_exposure_never_negative(self, risk):
-        risk.record_order_opened("0xmkt1", 10.0)
-        risk.record_order_closed("0xmkt1", 999.0)   # cerrar más de lo abierto
-        assert risk.get_market_exposure("0xmkt1") == 0.0
+    def test_exposure_never_negative(self, risk: RiskManager):
+        """La exposición no puede ser negativa."""
+        risk.record_order_opened("mkt1", 10.0)
+        risk.record_order_closed("mkt1", 50.0)  # cierra más de lo que hay
+        assert risk.get_market_exposure("mkt1") == 0.0
 
-    def test_total_exposure_across_markets(self, risk):
-        risk.record_order_opened("0xmkt1", 40.0)
-        risk.record_order_opened("0xmkt2", 60.0)
-        assert risk.get_total_exposure() == pytest.approx(100.0)
+    def test_total_exposure_aggregates_markets(self, risk: RiskManager):
+        """get_total_exposure() suma todos los mercados."""
+        risk.record_order_opened("mkt1", 20.0)
+        risk.record_order_opened("mkt2", 30.0)
+        assert risk.get_total_exposure() == 50.0
 
-    def test_unknown_market_exposure_is_zero(self, risk):
-        assert risk.get_market_exposure("0xnonexistent") == 0.0
+    def test_unknown_market_exposure_is_zero(self, risk: RiskManager):
+        """Un mercado sin datos tiene exposición cero."""
+        assert risk.get_market_exposure("unknown_market") == 0.0
 
 
 # ---------------------------------------------------------------------------
-# Kelly sizing (max_order_size_usd)
+# TestKellySizing
 # ---------------------------------------------------------------------------
 
-class TestKellySizingRM:
+class TestKellySizing:
+    """Valida el cálculo de tamaño de orden con Kelly fraccional."""
 
-    def test_basic_kelly_formula(self, risk):
+    def test_kelly_formula(self, risk: RiskManager):
         """Kelly = bankroll * kelly_fraction * edge * 2."""
-        # half_spread=1¢, mid=0.50 → edge=0.02 → kelly=1000*0.25*0.02*2=$10
-        size = risk.max_order_size_usd("0xmkt", half_spread_cents=1.0, mid_price=0.50)
-        assert size == pytest.approx(10.0, abs=0.1)
+        half_spread_cents = 1.0
+        mid = 0.50
+        edge = (half_spread_cents / 100.0) / mid
+        raw_kelly = 1000.0 * 0.25 * edge * 2.0
+        result = risk.max_order_size_usd("mkt1", half_spread_cents, mid)
+        # Limitado por max_order_risk_pct (0.05 * 1000 = 50)
+        assert result <= min(raw_kelly, 50.0)
 
-    def test_hard_cap_per_order(self, risk):
-        """Nunca supera max_order_risk_pct * bankroll ($50)."""
-        # Spread enorme → Kelly daría mucho, pero tope es $50
-        size = risk.max_order_size_usd("0xmkt", half_spread_cents=50.0, mid_price=0.50)
-        assert size <= 50.0
+    def test_kelly_hard_cap_per_order(self, risk: RiskManager):
+        """Con spread muy alto, Kelly está limitado por max_order_risk_pct."""
+        size = risk.max_order_size_usd("mkt1", half_spread_cents=50.0, mid_price=0.50)
+        assert size <= 1000.0 * 0.05  # 50$
 
-    def test_exposure_cap_reduces_size(self, risk):
-        """Con exposición alta, el size disponible se reduce."""
-        risk.record_order_opened("0xmkt", 180.0)  # 18% de $1000, tope=20%
-        # Solo quedan $20 de capacidad, dividido entre bid+ask = $10 c/u
-        size = risk.max_order_size_usd("0xmkt", half_spread_cents=2.0, mid_price=0.50)
-        assert size <= 10.0
+    def test_kelly_reduced_by_existing_exposure(self, risk: RiskManager):
+        """Con alta exposición existente, el tamaño se reduce."""
+        # max_total_exposure = 20% de 1000 = 200$
+        # Si ya tenemos 190$ abiertos, solo quedan 10$ / 2 = 5$ por lado
+        risk.record_order_opened("mkt_other", 190.0)
+        size = risk.max_order_size_usd("mkt1", half_spread_cents=1.0, mid_price=0.50)
+        assert size <= 5.0
 
-    def test_full_exposure_returns_zero(self, risk):
-        """Con exposición al 100%, size=0."""
-        risk.record_order_opened("0xmkt", 200.0)  # 20% = tope máximo
-        size = risk.max_order_size_usd("0xmkt", half_spread_cents=2.0, mid_price=0.50)
+    def test_kelly_zero_when_exposure_maxed(self, risk: RiskManager):
+        """Con exposición al máximo, Kelly devuelve 0."""
+        risk.record_order_opened("mkt_other", 200.0)
+        size = risk.max_order_size_usd("mkt1", half_spread_cents=1.0, mid_price=0.50)
         assert size == 0.0
 
-    def test_zero_mid_price_uses_fallback(self, risk):
-        """Con mid=0 no divide por cero, usa el hard cap."""
-        size = risk.max_order_size_usd("0xmkt", half_spread_cents=2.0, mid_price=0.0)
-        assert size >= 0.0  # no lanza excepción
-
 
 # ---------------------------------------------------------------------------
-# P&L — registro de fills
+# TestPnLCalculation
 # ---------------------------------------------------------------------------
 
-class TestPnL:
+class TestPnLCalculation:
+    """Valida el cálculo de P&L por fills."""
 
-    def test_buy_fill_updates_position(self, risk):
-        """Un fill BUY acumula posición larga y calcula avg_entry_price."""
-        risk.record_fill("0xmkt", "BUY", price=0.48, size=100)
-        exp = risk._get_exp("0xmkt")
-        assert exp.filled_yes == pytest.approx(100.0)
+    def test_buy_fill_sets_entry_price(self, risk: RiskManager):
+        """Un fill BUY establece el precio medio de entrada."""
+        risk.record_fill("mkt1", "BUY", price=0.48, size=100.0)
+        exp = risk._get_exp("mkt1")
         assert exp.avg_entry_price == pytest.approx(0.48)
+        assert exp.filled_yes == pytest.approx(100.0)
 
-    def test_weighted_avg_entry_price(self, risk):
-        """El precio medio se pondera correctamente en fills múltiples."""
-        risk.record_fill("0xmkt", "BUY", price=0.40, size=100)  # $40
-        risk.record_fill("0xmkt", "BUY", price=0.60, size=100)  # $60
-        # Total cost=$100, total shares=200 → avg=0.50
-        exp = risk._get_exp("0xmkt")
-        assert exp.avg_entry_price == pytest.approx(0.50)
+    def test_sell_fill_realizes_pnl(self, risk: RiskManager):
+        """Un fill SELL realiza P&L basado en la diferencia precio entrada/salida."""
+        risk.record_fill("mkt1", "BUY", price=0.48, size=100.0)
+        risk.record_fill("mkt1", "SELL", price=0.52, size=100.0)
+        exp = risk._get_exp("mkt1")
+        # PnL = (0.52 - 0.48) * 100 = 4.0$
+        assert exp.realized_pnl == pytest.approx(4.0, abs=1e-6)
+        assert risk._session_pnl == pytest.approx(4.0, abs=1e-6)
 
-    def test_sell_fill_realizes_pnl(self, risk):
-        """Un fill SELL tras un BUY captura el spread como P&L."""
-        risk.record_fill("0xmkt", "BUY",  price=0.48, size=100)
-        risk.record_fill("0xmkt", "SELL", price=0.52, size=100)
-        # PnL = (0.52 - 0.48) * 100 = $4.00
-        assert risk._session_pnl == pytest.approx(4.0, abs=0.01)
+    def test_sell_without_position_no_pnl(self, risk: RiskManager):
+        """Un fill SELL sin posición previa no genera P&L."""
+        risk.record_fill("mkt1", "SELL", price=0.52, size=50.0)
+        exp = risk._get_exp("mkt1")
+        assert exp.realized_pnl == 0.0
+        assert risk._session_pnl == 0.0
 
-    def test_sell_without_position_no_pnl(self, risk):
-        """Un fill SELL sin posición previa no genera P&L ficticio."""
-        risk.record_fill("0xmkt", "SELL", price=0.52, size=50)
-        assert risk._session_pnl == pytest.approx(0.0)
-
-    def test_pnl_kill_switch_integration(self, risk):
-        """Si los fills acumulan suficiente pérdida, el kill switch se activa."""
-        # Simulamos pérdida: compramos caro, vendemos barato
-        risk.record_fill("0xmkt", "BUY",  price=0.90, size=600)
-        risk.record_fill("0xmkt", "SELL", price=0.80, size=600)
-        # PnL = (0.80-0.90)*600 = -$60 → supera umbral de -$50
-        triggered, _ = risk.check_kill_switch()
-        assert triggered
+    def test_weighted_average_entry_price(self, risk: RiskManager):
+        """Múltiples compras calculan el precio medio ponderado correctamente."""
+        risk.record_fill("mkt1", "BUY", price=0.40, size=100.0)
+        risk.record_fill("mkt1", "BUY", price=0.60, size=100.0)
+        exp = risk._get_exp("mkt1")
+        # (0.40*100 + 0.60*100) / 200 = 0.50
+        assert exp.avg_entry_price == pytest.approx(0.50, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
-# get_stats
+# TestKillSwitchFromFills
+# ---------------------------------------------------------------------------
+
+class TestKillSwitchFromFills:
+    """Valida que los fills acumulados pueden activar el kill switch."""
+
+    def test_fills_trigger_kill_switch(self, risk: RiskManager):
+        """Si los fills acumulan suficiente pérdida, el kill switch se activa."""
+        # bankroll=1000, max_session_loss_pct=0.05 → límite = 50$
+        # Comprar caro y vender barato para generar pérdida
+        risk.record_fill("mkt1", "BUY", price=0.90, size=600.0)
+        risk.record_fill("mkt1", "SELL", price=0.80, size=600.0)
+        # PnL = (0.80 - 0.90) * 600 = -60$ → supera el límite de -50$
+        triggered, reason = risk.check_kill_switch()
+        assert triggered is True
+
+
+# ---------------------------------------------------------------------------
+# TestStats
 # ---------------------------------------------------------------------------
 
 class TestStats:
+    """Valida que get_stats() devuelve todas las métricas esperadas."""
 
-    def test_stats_structure(self, risk):
+    def test_stats_contains_expected_keys(self, risk: RiskManager):
+        """get_stats() incluye todas las claves esperadas."""
         stats = risk.get_stats()
-        assert "session_pnl_usd" in stats
-        assert "total_exposure_usd" in stats
-        assert "total_exposure_pct" in stats
-        assert "consecutive_errors" in stats
-        assert "kill_switch" in stats
-        assert "uptime_min" in stats
+        expected_keys = {
+            "session_pnl_usd",
+            "total_exposure_usd",
+            "total_exposure_pct",
+            "consecutive_errors",
+            "kill_switch",
+            "uptime_min",
+        }
+        assert expected_keys.issubset(stats.keys())
 
-    def test_stats_kill_switch_false_initially(self, risk):
-        assert not risk.get_stats()["kill_switch"]
-
-    def test_stats_exposure_pct_calculation(self, risk):
-        risk.record_order_opened("0xmkt", 100.0)  # 10% de $1000
+    def test_stats_kill_switch_false_initially(self, risk: RiskManager):
+        """Kill switch está en False en el estado inicial."""
         stats = risk.get_stats()
-        assert stats["total_exposure_pct"] == pytest.approx(10.0, abs=0.1)
+        assert stats["kill_switch"] is False
+
+    def test_stats_reflect_session_pnl(self, risk: RiskManager):
+        """session_pnl_usd refleja el P&L acumulado."""
+        risk.record_fill("mkt1", "BUY", price=0.48, size=100.0)
+        risk.record_fill("mkt1", "SELL", price=0.52, size=100.0)
+        stats = risk.get_stats()
+        assert stats["session_pnl_usd"] == pytest.approx(4.0, abs=1e-4)

@@ -12,7 +12,6 @@ Flujo:
 """
 
 import logging
-import os
 from pathlib import Path
 
 from py_clob_client.client import ClobClient

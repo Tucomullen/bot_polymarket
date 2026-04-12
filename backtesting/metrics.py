@@ -13,22 +13,20 @@ Métricas calculadas:
 import math
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 from backtesting.simulator import BacktestResult, SimStep
 
 logger = logging.getLogger("polybot.backtest.metrics")
 
-
 # ---------------------------------------------------------------------------
-# Umbrales mínimos para validar la estrategia (del PLAN_PREPRODUCCION.md)
+# Umbrales mínimos (del PLAN_PREPRODUCCION.md)
 # ---------------------------------------------------------------------------
 
-MIN_PNL = 0.0          # P&L neto positivo
-MIN_SHARPE = 0.5       # Sharpe ratio mínimo
-MAX_DRAWDOWN_PCT = 15.0  # Max drawdown < 15% del bankroll
-MIN_FILL_RATE = 5.0    # Fill rate > 5%
-MIN_PROFITABLE_DAYS = 60.0  # Días rentables > 60%
+MIN_PNL = 0.0
+MIN_SHARPE = 0.5
+MAX_DRAWDOWN_PCT = 15.0
+MIN_FILL_RATE = 5.0
+MIN_PROFITABLE_DAYS = 60.0
 
 
 @dataclass
@@ -37,29 +35,18 @@ class BacktestMetrics:
     condition_id: str
     question: str
 
-    # P&L
     pnl_usd: float = 0.0
     pnl_pct: float = 0.0
-
-    # Riesgo
     sharpe_ratio: float = 0.0
     max_drawdown_usd: float = 0.0
     max_drawdown_pct: float = 0.0
-
-    # Actividad
     fill_rate_pct: float = 0.0
     n_fills: int = 0
     total_volume_usd: float = 0.0
-
-    # Días
     n_days: float = 0.0
     profitable_days_pct: float = 0.0
-
-    # Calidad
-    profit_factor: float = 0.0      # ganancias / pérdidas (> 1 = rentable)
+    profit_factor: float = 0.0
     avg_pnl_per_fill: float = 0.0
-
-    # Validación
     passes: bool = False
     failure_reasons: list[str] = field(default_factory=list)
 
@@ -76,10 +63,9 @@ class BacktestMetrics:
 
 
 def _daily_pnl(steps: list[SimStep]) -> list[float]:
-    """Agrupa los P&L por día y devuelve la lista de P&L diario."""
+    """Agrupa los P&L por día."""
     if not steps:
         return []
-
     daily: dict[int, float] = {}
     prev_pnl = 0.0
     for s in steps:
@@ -87,15 +73,11 @@ def _daily_pnl(steps: list[SimStep]) -> list[float]:
         delta = s.cumulative_pnl - prev_pnl
         daily[day] = daily.get(day, 0.0) + delta
         prev_pnl = s.cumulative_pnl
-
     return list(daily.values())
 
 
 def _sharpe(daily_returns: list[float], risk_free_daily: float = 0.0) -> float:
-    """
-    Calcula el Sharpe ratio anualizado a partir de retornos diarios.
-    Usa sqrt(365) para anualizar.
-    """
+    """Calcula el Sharpe ratio anualizado a partir de retornos diarios."""
     n = len(daily_returns)
     if n < 2:
         return 0.0
@@ -108,9 +90,7 @@ def _sharpe(daily_returns: list[float], risk_free_daily: float = 0.0) -> float:
 
 
 def calculate_metrics(result: BacktestResult) -> BacktestMetrics:
-    """
-    Calcula todas las métricas de rendimiento para un BacktestResult.
-    """
+    """Calcula todas las métricas de rendimiento para un BacktestResult."""
     m = BacktestMetrics(
         condition_id=result.condition_id,
         question=result.question,
@@ -123,36 +103,23 @@ def calculate_metrics(result: BacktestResult) -> BacktestMetrics:
         total_volume_usd=round(result.total_volume_usd, 2),
     )
 
-    # Días cubiertos
     if result.steps:
-        first_ts = result.steps[0].timestamp
-        last_ts = result.steps[-1].timestamp
-        m.n_days = round((last_ts - first_ts) / 86400, 1)
-    else:
-        m.n_days = 0.0
+        m.n_days = round((result.steps[-1].timestamp - result.steps[0].timestamp) / 86400, 1)
 
-    # P&L diario → Sharpe
     daily = _daily_pnl(result.steps)
     m.sharpe_ratio = round(_sharpe(daily), 3)
 
-    # Días rentables
     if daily:
         profitable = sum(1 for d in daily if d > 0)
         m.profitable_days_pct = round(profitable / len(daily) * 100, 1)
-    else:
-        m.profitable_days_pct = 0.0
 
-    # Profit factor
     gross_gains = sum(f.pnl_this_fill for f in result.fills if f.pnl_this_fill > 0)
     gross_losses = abs(sum(f.pnl_this_fill for f in result.fills if f.pnl_this_fill < 0))
     m.profit_factor = round(gross_gains / gross_losses, 3) if gross_losses > 0 else (
         float("inf") if gross_gains > 0 else 0.0
     )
-
-    # P&L medio por fill
     m.avg_pnl_per_fill = round(result.final_pnl / max(result.n_fills, 1), 6)
 
-    # Validación contra umbrales del plan
     reasons = []
     if m.pnl_usd <= MIN_PNL:
         reasons.append(f"PnL={m.pnl_usd:.4f} <= 0")
@@ -167,23 +134,18 @@ def calculate_metrics(result: BacktestResult) -> BacktestMetrics:
 
     m.failure_reasons = reasons
     m.passes = len(reasons) == 0
-
     return m
 
 
 def aggregate_metrics(all_metrics: list[BacktestMetrics]) -> dict:
-    """
-    Agrega métricas de todos los mercados en un resumen global.
-    """
+    """Agrega métricas de todos los mercados en un resumen global."""
     if not all_metrics:
         return {}
-
     total_pnl = sum(m.pnl_usd for m in all_metrics)
     avg_sharpe = sum(m.sharpe_ratio for m in all_metrics) / len(all_metrics)
     worst_dd = max(m.max_drawdown_pct for m in all_metrics)
     avg_fill_rate = sum(m.fill_rate_pct for m in all_metrics) / len(all_metrics)
     markets_passing = sum(1 for m in all_metrics if m.passes)
-
     return {
         "n_markets": len(all_metrics),
         "markets_passing": markets_passing,

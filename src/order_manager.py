@@ -152,7 +152,7 @@ class OrderManager:
             {"created": [...], "cancelled": [...], "unchanged": [...]}
         """
         cid = pair.market.condition_id
-        actions = {"created": [], "cancelled": [], "unchanged": []}
+        actions: dict[str, list] = {"created": [], "cancelled": [], "unchanged": []}
 
         if not pair.is_complete:
             # Si no hay quotes completas, cancelar todo lo que tengamos en ese mercado
@@ -331,7 +331,7 @@ class OrderManager:
             return True
 
         try:
-            resp = self._clob.cancel(order.order_id)
+            self._clob.cancel(order.order_id)
             order.status = "CANCELLED"
             self.metrics["orders_cancelled"] += 1
             logger.info("🗑️ Orden cancelada — id=%s", order.order_id[:16])
@@ -395,7 +395,6 @@ class OrderManager:
             logger.debug("⚠️  fee-rate error: %s", exc)
 
         # Fallback: devolver 0 (sin fees) si no podemos consultar
-        # Esto es seguro porque 0 bps = sin fees = la orden se aceptará igual
         return 0
 
     # ------------------------------------------------------------------
@@ -440,9 +439,7 @@ class OrderManager:
             self.metrics["fills_received"] += 1
 
     def process_order_update(self, data: dict[str, Any]) -> None:
-        """
-        Procesa un evento de orden del WebSocket user channel.
-        """
+        """Procesa un evento de orden del WebSocket user channel."""
         order_id = data.get("id", "")
         event_type = data.get("type", "")
 
