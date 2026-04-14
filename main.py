@@ -40,6 +40,7 @@ from src.websocket_manager import WebSocketManager, WSSAuth
 from src.orderbook import OrderbookTracker
 from src.discovery import MarketDiscovery, DiscoveryConfig, MarketCandidate
 from src.trading_loop import TradingLoop
+from src.quoting import QuotePair
 from src.risk_manager import RiskManager
 from src.dashboard import DashboardServer, BotState, DashboardLogHandler
 from src.telegram_alerts import TelegramAlerter
@@ -70,6 +71,8 @@ bot_state = BotState()
 orderbook_tracker = OrderbookTracker()
 trading_loop: TradingLoop | None = None  # Se inicializa tras el discovery
 telegram: TelegramAlerter = TelegramAlerter.from_env()
+_market_questions: dict[str, str] = {}  # condition_id → question (para notificaciones de fills)
+_simulation_mode: bool = True
 
 
 async def on_market_event(data: dict[str, Any] | list) -> None:
@@ -115,6 +118,15 @@ async def on_user_event(data: dict[str, Any]) -> None:
             data.get("size"),
             data.get("status"),
         )
+        # Notificar fill por Telegram
+        _cid = data.get("market", "")
+        asyncio.create_task(telegram.send_fill(
+            side=data.get("side", ""),
+            price=float(data.get("price", 0) or 0),
+            size=float(data.get("size", 0) or 0),
+            question=_market_questions.get(_cid, _cid[:20]),
+            simulation=_simulation_mode,
+        ))
         bot_state.push_event({
             "type": "TRADE",
             "side": data.get("side", ""),
@@ -258,6 +270,16 @@ async def run_bot() -> None:
             logger.exception("❌ Error en Discovery")
         # No cerramos discovery aquí — lo reutilizaremos para el re-scan periódico
 
+    # Registrar modo simulación y preguntas de mercados para las notificaciones de fills
+    global _simulation_mode, _market_questions
+    _simulation_mode = cfg.simulation_mode
+    for m in discovered_markets:
+        _market_questions[m.condition_id] = m.question
+
+    # Notificar si se encontraron mercados en el discovery inicial
+    if discovered_markets:
+        await telegram.send_markets_found(discovered_markets)
+
     if token_ids:
         ws_manager.subscribe_market(token_ids)
         logger.info("📡 Suscrito a market channel — %d tokens", len(token_ids))
@@ -289,6 +311,16 @@ async def run_bot() -> None:
         float(_optional_env("MAX_SESSION_LOSS_PCT", "0.05")) * 100,
     )
 
+    def _on_quote(market: MarketCandidate, pair: QuotePair) -> None:
+        """Actualiza el dashboard con los precios reales de la quote generada."""
+        bot_state.update_quote(
+            market.condition_id,
+            market.question,
+            pair.bid.price,
+            pair.ask.price,
+            pair.mid_at_generation,
+        )
+
     if discovered_markets:
         trading_loop = TradingLoop(
             markets=discovered_markets,
@@ -298,6 +330,7 @@ async def run_bot() -> None:
             bankroll_usd=bankroll_usd,
             cycle_interval_ms=float(_optional_env("CYCLE_INTERVAL_MS", "500")),
             risk_manager=risk_manager,
+            quote_callback=_on_quote,
         )
         logger.info(
             "🔄 Trading loop configurado — %d mercados, simulation=%s",
@@ -312,9 +345,8 @@ async def run_bot() -> None:
         simulation=cfg.simulation_mode,
         bankroll=bankroll_usd,
     )
-    for m in discovered_markets:
-        bot_state.update_quote(m.condition_id, m.question,
-                               m.best_bid, m.best_ask, m.midpoint)
+    # Las quotes del dashboard se actualizarán en el primer ciclo del trading loop
+    # via quote_callback (usando los precios reales generados por el QuotingEngine).
 
     # 7. Lanzar WebSockets + Trading Loop con manejo de señal para cierre limpio
     loop = asyncio.get_running_loop()
@@ -342,8 +374,17 @@ async def run_bot() -> None:
             try:
                 logger.info("🔍 Re-scan periódico de mercados...")
                 new_markets = await discovery.scan(force=True)
-                if new_markets and trading_loop:
-                    trading_loop.update_markets(new_markets)
+                if new_markets:
+                    # Actualizar dict de preguntas para notificaciones de fills
+                    for m in new_markets:
+                        _market_questions[m.condition_id] = m.question
+                    # Notificar si los mercados cambiaron respecto a los anteriores
+                    prev_cids = {m.condition_id for m in (trading_loop._markets if trading_loop else [])}
+                    new_cids = {m.condition_id for m in new_markets}
+                    if new_cids != prev_cids:
+                        await telegram.send_markets_found(new_markets)
+                    if trading_loop:
+                        trading_loop.update_markets(new_markets)
                     logger.info("✅ Re-scan completado — %d mercados activos", len(new_markets))
             except Exception:
                 logger.exception("❌ Error en re-scan periódico")

@@ -18,13 +18,15 @@ Este módulo NO conoce los detalles de la API — delega en:
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 from src.discovery import MarketCandidate
 from src.orderbook import OrderbookTracker
-from src.quoting import QuotingEngine, QuotingConfig
+from src.quoting import QuotingEngine, QuotingConfig, QuotePair
 from src.order_manager import OrderManager, OrderManagerConfig
 from src.risk_manager import RiskManager
+
+QuoteCallback = Callable[[MarketCandidate, QuotePair], None]
 
 logger = logging.getLogger("polybot.loop")
 
@@ -47,6 +49,7 @@ class TradingLoop:
         bankroll_usd: float = 1000.0,
         cycle_interval_ms: float = 500,   # Intervalo entre ciclos en ms
         risk_manager: RiskManager | None = None,
+        quote_callback: "QuoteCallback | None" = None,
     ):
         self._markets = markets
         self._orderbook = orderbook
@@ -56,6 +59,7 @@ class TradingLoop:
         self._running = False
         self._cycle_count = 0
         self._risk = risk_manager  # None en modo legacy (sin gestión de riesgo)
+        self._quote_callback = quote_callback
 
         # Componentes
         self._quoting = QuotingEngine(
@@ -177,6 +181,10 @@ class TradingLoop:
                 market.question[:40],
             )
             return
+
+        # Notificar al dashboard con los precios reales de la quote
+        if self._quote_callback is not None:
+            self._quote_callback(market, pair)
 
         # Sincronizar con órdenes vivas (cancel obsoletas + crear nuevas)
         actions = await self._orders.sync_quotes(pair)
