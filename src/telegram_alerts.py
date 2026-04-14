@@ -123,6 +123,42 @@ class TelegramAlerter:
         )
         await self.send(msg)
 
+    async def send_markets_found(self, markets: list) -> None:
+        """Aviso cuando el discovery encuentra mercados para operar."""
+        if not markets:
+            return
+        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        lines = [f"🎯 <b>Discovery — {len(markets)} mercado(s) encontrado(s)</b> ({now})\n"]
+        for m in markets:
+            nivel = "L2 50%" if getattr(m, "market_level", 1) == 2 else "L1"
+            lines.append(
+                f"• <b>{m.question[:55]}</b>\n"
+                f"  spread={m.spread_cents:.1f}¢ | mid={m.midpoint:.2f} | "
+                f"score={m.score:.0f} | {nivel}"
+            )
+        await self.send("\n".join(lines))
+
+    async def send_fill(
+        self,
+        side: str,
+        price: float,
+        size: float,
+        question: str,
+        simulation: bool,
+    ) -> None:
+        """Notificacion cuando se ejecuta una orden (fill/trade)."""
+        size_usd = price * size
+        icon = "🟢" if side.upper() == "BUY" else "🔴"
+        mode = " [SIM]" if simulation else ""
+        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        msg = (
+            f"{icon} <b>Fill{mode} — {side.upper()}</b>\n"
+            f"Mercado: {question[:55]}\n"
+            f"Precio: {price:.3f} | Shares: {size:.1f} | ~${size_usd:.2f}\n"
+            f"Hora: {now}"
+        )
+        await self.send(msg)
+
     async def send_error(self, error: str) -> None:
         now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         msg = f"<b>Error critico</b>\n{error[:300]}\nHora: {now}"

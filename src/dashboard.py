@@ -211,7 +211,12 @@ def create_app(state: BotState, password: str = "") -> FastAPI:
 
     @app.post("/api/kill-switch")
     async def kill_switch(body: dict = {}) -> JSONResponse:
-        if password and body.get("password") != password:
+        # La contraseña es SIEMPRE obligatoria si está configurada.
+        # Si no está configurada, el kill switch queda desactivado desde la red
+        # para evitar que scanners externos lo disparen accidentalmente.
+        if not password:
+            return JSONResponse({"error": "kill-switch disabled: set DASHBOARD_PASSWORD in .env"}, status_code=403)
+        if body.get("password") != password:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if state._risk is None:
             return JSONResponse({"error": "risk_manager not available"}, status_code=503)
@@ -363,11 +368,13 @@ function updateLogs(lines){
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 async function activateKillSwitch(){
   if(!confirm('Activar KILL SWITCH? Esto cancelara todas las ordenes abiertas.'))return;
+  const pwd=prompt('Introduce la contrasena del dashboard:');
+  if(pwd===null)return;
   try{
-    const r=await fetch('/api/kill-switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'activado manualmente'})});
+    const r=await fetch('/api/kill-switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'activado manualmente desde el dashboard',password:pwd})});
     const d=await r.json();
     if(d.ok)alert('Kill switch activado correctamente.');
-    else alert('Error: '+JSON.stringify(d));
+    else alert('Error: '+(d.error||JSON.stringify(d)));
   }catch(e){alert('Error de red: '+e);}
 }
 function connectSSE(){

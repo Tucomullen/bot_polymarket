@@ -59,6 +59,7 @@ class QuotingConfig:
     # Recotización
     requote_threshold_cents: float = 0.5  # Recotizar si el mid se mueve más de esto
     max_quote_age_sec: float = 5.0        # Forzar recotización si la quote tiene más de 5s
+    level_r_max_quote_age_sec: float = 30.0  # Level R: recotizar solo cada 30s (menos churn)
 
 
 # ---------------------------------------------------------------------------
@@ -155,24 +156,30 @@ class QuotingEngine:
         # 1. Obtener estado del orderbook
         book_yes = self._orderbook.get(market.token_id_yes)
 
-        # Usar datos del book si están frescos, sino los del discovery
-        if book_yes and book_yes.last_update > 0 and book_yes.best_bid > 0:
+        # Usar datos del book si están frescos Y el libro es real (spread ≤ 50c).
+        # Para Level R (y outrights en general) el CLOB muestra bid=0.001/ask=0.999:
+        # ignorar esos datos y usar el midpoint de outcomePrices del discovery.
+        _book_is_real = (
+            book_yes is not None
+            and book_yes.last_update > 0
+            and book_yes.best_bid > 0
+            and (book_yes.best_ask - book_yes.best_bid) <= 0.50
+        )
+        if _book_is_real:
             mid = book_yes.midpoint
             best_bid = book_yes.best_bid
             best_ask = book_yes.best_ask
-            current_spread = book_yes.spread
         else:
             mid = market.midpoint
-            best_bid = market.best_bid
-            best_ask = market.best_ask
-            current_spread = market.spread_cents
+            best_bid = 0.0   # Sin referencia de libro real → la protección anti-cruce se omite
+            best_ask = 0.0
 
         if mid <= 0 or mid >= 1:
             logger.debug("⚠️  Mid inválido (%.3f) para %s", mid, market.question[:40])
             return QuotePair(market=market)
 
         # 2. Calcular spread dinámico
-        half_spread = self._compute_half_spread(market, current_spread)
+        half_spread = self._compute_half_spread(market)
 
         # 3. Calcular skew por inventario
         skew = self._compute_inventory_skew(inventory_yes, inventory_no)
@@ -267,17 +274,21 @@ class QuotingEngine:
         if not last or not last.is_complete:
             return True, "no_existing_quote"
 
-        # Edad de la quote
-        if last.age_sec > self.cfg.max_quote_age_sec:
+        # Edad de la quote — Level R recotiza más despacio (menos churn, libro vacío)
+        is_level_r = getattr(market, "market_level", 0) == 3
+        max_age = self.cfg.level_r_max_quote_age_sec if is_level_r else self.cfg.max_quote_age_sec
+        if last.age_sec > max_age:
             return True, f"quote_stale_{last.age_sec:.1f}s"
 
-        # El midpoint se movió significativamente
-        book = self._orderbook.get(market.token_id_yes)
-        if book and book.last_update > 0 and book.best_bid > 0:
-            current_mid = book.midpoint
-            delta_cents = abs(current_mid - last.mid_at_generation) * 100
-            if delta_cents >= self.cfg.requote_threshold_cents:
-                return True, f"mid_moved_{delta_cents:.1f}c"
+        # Movimiento del midpoint — solo para libros reales (no placeholder)
+        if not is_level_r:
+            book = self._orderbook.get(market.token_id_yes)
+            if book and book.last_update > 0 and book.best_bid > 0:
+                if (book.best_ask - book.best_bid) <= 0.50:  # libro real
+                    current_mid = book.midpoint
+                    delta_cents = abs(current_mid - last.mid_at_generation) * 100
+                    if delta_cents >= self.cfg.requote_threshold_cents:
+                        return True, f"mid_moved_{delta_cents:.1f}c"
 
         return False, ""
 
@@ -288,9 +299,7 @@ class QuotingEngine:
     # Cálculos internos
     # ------------------------------------------------------------------
 
-    def _compute_half_spread(
-        self, market: MarketCandidate, current_spread: float
-    ) -> float:
+    def _compute_half_spread(self, market: MarketCandidate) -> float:
         """
         Calcula el half-spread dinámico (mitad del spread total).
         """
@@ -363,6 +372,20 @@ class QuotingEngine:
                 size = max(size, market.reward_min_size)
             size = max(self.cfg.min_order_size_usd, min(size, self.cfg.max_order_size_usd))
             size = min(size, bankroll_usd * 0.05)
+
+        level = getattr(market, "market_level", 1)
+
+        # Nivel 2: libro de menor calidad → reducir tamaño al 50%
+        if level == 2:
+            size *= 0.5
+            size = max(self.cfg.min_order_size_usd, size)
+
+        # Nivel R: reward farming — tamaño mínimo fijo para limitar adverse selection.
+        # El beneficio viene de los rewards, no del spread capturado.
+        elif level == 3:
+            size = self.cfg.min_order_size_usd
+            if market.reward_min_size > 0:
+                size = max(size, market.reward_min_size)
 
         return size
 

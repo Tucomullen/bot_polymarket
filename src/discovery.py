@@ -67,11 +67,25 @@ class DiscoveryConfig:
     refresh_interval_sec: int = 300
 
     # --- Filtros duros (si no pasa, se descarta) ---
-    min_volume_24h: float = 100.0        # USD (relajado para capturar más mercados)
-    max_spread_cents: float = 15.0       # Céntimos (relajado; el scoring penalizará spreads altos)
+    min_volume_24h: float = 100.0        # USD
+    max_spread_cents: float = 15.0       # Céntimos — Nivel 1 (estricto)
+    min_book_depth: float = 30.0         # Shares mínimas en top-5 por cada lado — Nivel 1
     min_price: float = 0.03              # Evitar mercados decididos
     max_price: float = 0.97
     min_time_to_resolution_hours: float = 0.25
+
+    # --- Nivel 2 (prudente) — solo se activa si Nivel 1 no encuentra mercados ---
+    # Tamaños reducidos al 50%, controles de riesgo iguales
+    level2_max_spread_cents: float = 30.0
+    level2_min_book_depth: float = 10.0
+    level2_min_volume_24h: float = 500.0
+
+    # --- Nivel R (reward farming) — activo SIEMPRE en paralelo con L1/L2 ---
+    # Cotiza en mercados con liquidity rewards donde el libro CLOB está vacío.
+    # Usa outcomePrices como midpoint real. Tamaños mínimos para limitar adverse selection.
+    enable_reward_farming: bool = True
+    max_reward_markets: int = 2             # Máximo de mercados reward farming simultáneos
+    level_r_min_daily_reward: float = 5.0   # Reward mínimo diario en USD para considerarlo
 
     # --- Pesos del scoring (suman ~1.0) ---
     w_category: float = 0.15
@@ -165,6 +179,12 @@ class MarketCandidate:
     midpoint: float = 0.5
     last_trade_price: float = 0.0
     recent_trade_count: int = 0        # Trades en las últimas horas
+    book_depth_min: float = 0.0        # min(bid_depth_top5, ask_depth_top5) en shares
+
+    # Nivel de calidad del mercado (asignado por discovery)
+    # 0 = no cualificado | 1 = estricto (normal) | 2 = prudente (tamaño 50%)
+    # 3 = reward farming (libro vacío, usa outcomePrices, tamaño mínimo)
+    market_level: int = 0
 
     # Tiempo
     end_date: str = ""
@@ -208,9 +228,29 @@ class MarketDiscovery:
         self._reward_markets: dict[str, dict] = {}  # cache de rewards
         self._last_scan: float = 0.0
         self._cached_ranking: list[MarketCandidate] = []
+        self._empty_scan_count: int = 0  # scans consecutivos sin mercados (ventana temporal)
 
     async def close(self) -> None:
         await self._http.aclose()
+
+    def _get_l2_thresholds(self) -> tuple[float, float]:
+        """
+        Umbrales dinámicos para Nivel 2 según scans consecutivos vacíos.
+
+        Ventana temporal: si no hay mercados, relaja gradualmente el Nivel 2
+        para no quedarse parado indefinidamente. El volumen mínimo no se relaja.
+
+          0-5 scans (0-25 min):  spread ≤ 30c, depth ≥ 10  (estricto)
+          6-11 scans (30-55 min): spread ≤ 40c, depth ≥ 5  (relajado-1)
+          12+ scans (≥1 hora):   spread ≤ 50c, depth ≥ 3  (relajado-2)
+        """
+        n = self._empty_scan_count
+        if n < 6:
+            return self.cfg.level2_max_spread_cents, self.cfg.level2_min_book_depth
+        elif n < 12:
+            return 40.0, 5.0
+        else:
+            return 50.0, 3.0
 
     # ------------------------------------------------------------------
     # API pública
@@ -254,34 +294,111 @@ class MarketDiscovery:
         # 4. Enriquecer solo los candidatos que pasaron los filtros
         await self._enrich_candidates(filtered)
 
-        # 5. Scoring
+        # 4b. Clasificar en niveles con datos CLOB reales
+        # Nivel 1 (estricto): spread ajustado + profundidad real → tamaño normal
+        # Nivel 2 (prudente): umbrales dinámicos (ventana temporal) → tamaño 50% → solo si Nivel 1 vacío
+        l2_max_spread, l2_min_depth = self._get_l2_thresholds()
+        level1, level2 = [], []
+        price_ok = lambda c: self.cfg.min_price <= c.midpoint <= self.cfg.max_price
+        has_book  = lambda c: c.best_bid > 0 and c.best_ask > 0
+
         for c in filtered:
+            if not has_book(c) or not price_ok(c):
+                continue  # Nivel 3: sin libro o precio fuera de rango → no cotizar
+            if (c.spread_cents <= self.cfg.max_spread_cents
+                    and c.book_depth_min >= self.cfg.min_book_depth):
+                c.market_level = 1
+                level1.append(c)
+            elif (c.spread_cents <= l2_max_spread
+                    and c.book_depth_min >= l2_min_depth
+                    and c.volume_24h >= self.cfg.level2_min_volume_24h):
+                c.market_level = 2
+                level2.append(c)
+
+        pre_clob_count = len(filtered)
+        enriched_all = filtered[:]  # copia antes de reasignar — Level R la necesita
+        if level1:
+            filtered = level1
+            logger.info("   ✅ Nivel 1 — %d mercados (spread≤%.0fc, depth≥%.0f)", len(level1),
+                        self.cfg.max_spread_cents, self.cfg.min_book_depth)
+        elif level2:
+            filtered = level2
+            logger.warning(
+                "   ⚠️  Nivel 2 activado — %d mercados (spread≤%.0fc, depth≥%.0f, scans_vacíos=%d) "
+                "— tamaños al 50%% por menor calidad de libro",
+                len(level2), l2_max_spread, l2_min_depth, self._empty_scan_count,
+            )
+        else:
+            filtered = []
+            logger.info(
+                "   🔬 %d descartados tras CLOB — ninguno pasa Nivel 1 (spread≤%.0fc, depth≥%.0f) "
+                "ni Nivel 2 (spread≤%.0fc, depth≥%.0f) — scans_vacíos=%d",
+                pre_clob_count,
+                self.cfg.max_spread_cents, self.cfg.min_book_depth,
+                l2_max_spread, l2_min_depth,
+                self._empty_scan_count,
+            )
+
+        # 4c. Nivel R (reward farming) — activo EN PARALELO con L1/L2.
+        # Opera en mercados con rewards donde el libro CLOB está vacío (spread > 50c).
+        # Usa outcomePrices como midpoint real. Tamaño mínimo para limitar adverse selection.
+        level_r: list[MarketCandidate] = []
+        if self.cfg.enable_reward_farming:
+            reward_candidates = [
+                c for c in enriched_all
+                if c.market_level == 0                          # No clasificado aún (L1/L2 no lo tomó)
+                and c.daily_reward_usd >= self.cfg.level_r_min_daily_reward
+                and c.reward_max_spread > 0
+                and price_ok(c)                                 # midpoint real en rango válido
+            ]
+            reward_candidates.sort(key=lambda c: c.daily_reward_usd, reverse=True)
+            for c in reward_candidates[: self.cfg.max_reward_markets]:
+                c.market_level = 3
+                level_r.append(c)
+
+            if level_r:
+                logger.info(
+                    "   🎁 Nivel R — %d mercados reward farming (libro vacío, usa outcomePrices)",
+                    len(level_r),
+                )
+
+        # 5. Scoring (L1/L2 + Level R)
+        all_active = filtered + level_r
+        for c in all_active:
             self._compute_score(c)
 
-        # 6. Ordenar por score
+        # 6. Ordenar por score dentro de cada grupo
         filtered.sort(key=lambda x: x.score, reverse=True)
+        level_r.sort(key=lambda x: x.daily_reward_usd, reverse=True)
 
-        # 7. Tomar top N
-        top = filtered[: self.cfg.max_active_markets]
+        # 7. Tomar top N de L1/L2 + todos los Level R seleccionados
+        top = filtered[: self.cfg.max_active_markets] + level_r
 
         self._cached_ranking = top
         self._last_scan = now
 
+        strategy_markets = [m for m in top if m.market_level in (1, 2)]
+        if strategy_markets:
+            self._empty_scan_count = 0  # Resetear ventana temporal
+        elif not level_r:
+            # Solo contar como vacío si tampoco hay Level R
+            self._empty_scan_count += 1
+            next_l2_spread, next_l2_depth = self._get_l2_thresholds()
+            logger.warning(
+                "⚠️  No se encontraron mercados L1/L2 (scan vacío #%d) — "
+                "próximo Nivel 2: spread≤%.0fc, depth≥%.0f",
+                self._empty_scan_count, next_l2_spread, next_l2_depth,
+            )
+
         if top:
-            logger.info("🏆 Top %d mercados seleccionados:", len(top))
+            logger.info("🏆 %d mercados activos:", len(top))
             for i, m in enumerate(top, 1):
+                lvl_label = {1: "L1", 2: "L2-50%", 3: "LR-reward"}.get(m.market_level, "?")
                 logger.info(
-                    "   %d. [%.1f] %s — spread=%.1f¢, vol=$%.0f, rebates=%s, rewards=%s",
-                    i,
-                    m.score,
-                    m.question[:60],
-                    m.spread_cents,
-                    m.volume_24h,
-                    "✅" if m.has_maker_rebates else "❌",
-                    "✅" if m.has_liquidity_rewards else "❌",
+                    "   %d. [%s][%.1f] %s — spread=%.1f¢, mid=%.2f, reward=$%.0f/d",
+                    i, lvl_label, m.score, m.question[:55],
+                    m.spread_cents, m.midpoint, m.daily_reward_usd,
                 )
-        else:
-            logger.warning("⚠️  No se encontraron mercados que pasen los filtros")
 
         return top
 
@@ -290,20 +407,24 @@ class MarketDiscovery:
     # ------------------------------------------------------------------
 
     async def _fetch_gamma_markets(self) -> list[dict]:
-        """Obtiene mercados activos de la Gamma API."""
+        """
+        Obtiene mercados activos de la Gamma API con paginación completa.
+        Recorre hasta 5 páginas (500 mercados) para no perdernos mercados
+        near-50% que estén fuera del primer bloque de 100.
+        """
         all_markets: list[dict] = []
-        cursor = ""
         limit = 100
+        max_pages = 5  # Máximo 500 mercados — suficiente sin sobrecargar la API
 
         try:
-            while True:
+            for page in range(max_pages):
+                offset = page * limit
                 params: dict[str, Any] = {
                     "active": "true",
                     "closed": "false",
                     "limit": limit,
+                    "offset": offset,
                 }
-                if cursor:
-                    params["next_cursor"] = cursor
 
                 resp = await self._http.get(
                     f"{self.cfg.gamma_host}/markets",
@@ -314,7 +435,8 @@ class MarketDiscovery:
 
                 if isinstance(data, list):
                     all_markets.extend(data)
-                    break
+                    if len(data) < limit:
+                        break  # Última página
                 elif isinstance(data, dict):
                     markets = data.get("data", data.get("markets", []))
                     all_markets.extend(markets)
@@ -379,8 +501,18 @@ class MarketDiscovery:
             last_trade = float(raw.get("lastTradePrice", 0) or 0)
 
             if best_bid > 0 and best_ask > 0:
-                midpoint = (best_bid + best_ask) / 2.0
                 spread_cents = round((best_ask - best_bid) * 100, 2)
+                if spread_cents > 50:
+                    # Bid/ask son placeholders (0.001/0.999) — usar outcomePrices
+                    # para la probabilidad real del mercado
+                    outcome_prices_raw = raw.get("outcomePrices", "")
+                    try:
+                        op = _json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+                        midpoint = float(op[0]) if op else (best_bid + best_ask) / 2.0
+                    except Exception:
+                        midpoint = (best_bid + best_ask) / 2.0
+                else:
+                    midpoint = (best_bid + best_ask) / 2.0
             else:
                 outcome_prices = raw.get("outcomePrices", "")
                 midpoint = 0.5
@@ -530,7 +662,7 @@ class MarketDiscovery:
             logger.debug("   ⚠️  fee-rate error para %s: %s", c.condition_id[:12], exc)
 
     async def _fetch_top_of_book(self, c: MarketCandidate) -> None:
-        """Consulta el orderbook para obtener best bid/ask y spread."""
+        """Consulta el orderbook para obtener best bid/ask, spread y profundidad."""
         try:
             resp = await self._http.get(
                 f"{self.cfg.clob_host}/book",
@@ -548,7 +680,15 @@ class MarketDiscovery:
 
                 if c.best_bid > 0 and c.best_ask > 0:
                     c.spread_cents = round((c.best_ask - c.best_bid) * 100, 2)
-                    c.midpoint = (c.best_bid + c.best_ask) / 2.0
+                    # Solo actualizar midpoint si el libro es real (no placeholder 0.001/0.999).
+                    # Si spread > 50c, conservar el midpoint de outcomePrices del parseo inicial.
+                    if c.spread_cents <= 50:
+                        c.midpoint = (c.best_bid + c.best_ask) / 2.0
+
+                # Profundidad: suma de tamaños en top-5 niveles por lado
+                bid_depth = sum(float(b.get("size", 0)) for b in bids[:5])
+                ask_depth = sum(float(a.get("size", 0)) for a in asks[:5])
+                c.book_depth_min = min(bid_depth, ask_depth)
         except Exception as exc:
             logger.debug("   ⚠️  book error para %s: %s", c.condition_id[:12], exc)
 
@@ -557,12 +697,21 @@ class MarketDiscovery:
     # ------------------------------------------------------------------
 
     def _apply_hard_filters(self, candidates: list[MarketCandidate]) -> list[MarketCandidate]:
-        """Descarta mercados que no cumplen los mínimos."""
+        """
+        Descarta mercados que no cumplen los mínimos básicos.
+
+        El umbral de spread usa el máximo entre Nivel 1 y Nivel 2 (dinámico) para
+        que los candidatos de Nivel 2 lleguen al enriquecimiento CLOB. El filtrado
+        fino (depth, calidad del libro) ocurre después con datos CLOB reales.
+        """
+        l2_max_spread, _ = self._get_l2_thresholds()
+        # Pre-filtro generoso: no excluir candidatos que podrían clasificar en Nivel 2
+        hard_spread_cutoff = max(self.cfg.max_spread_cents, l2_max_spread)
         result = []
         for c in candidates:
             if c.volume_24h < self.cfg.min_volume_24h and c.volume_24h > 0:
                 continue
-            if c.spread_cents < 90 and c.spread_cents > self.cfg.max_spread_cents:
+            if c.spread_cents > hard_spread_cutoff:
                 continue
             mid = c.midpoint
             if mid < self.cfg.min_price or mid > self.cfg.max_price:
