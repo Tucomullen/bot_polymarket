@@ -6,14 +6,14 @@
 #   2. Las credenciales en /home/ubuntu/bot/.env son correctas (L1 + L2)
 #   3. Bot estable en paper trading (7+ días sin crash)
 #
-# USO (desde Windows Git Bash):
+# USO:
 #   bash deploy/go_live.sh
 #
 # El script NO hace nada destructivo sin confirmación explícita.
 
 set -euo pipefail
 
-SSH_KEY="C:/Users/Lgarc/Proyectos/.ssh/ssh-key-2026-04-12.key"
+SSH_KEY="${SSH_KEY_PATH:-$HOME/.ssh/ssh-key-2026-04-12.key}"
 HOST="ubuntu@129.213.115.16"
 ENV_FILE="/home/ubuntu/bot/.env"
 
