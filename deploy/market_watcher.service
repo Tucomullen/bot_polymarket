@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket Market Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/bot
+ExecStart=/home/ubuntu/bot/venv/bin/python deploy/market_watcher.py
+Restart=on-failure
+RestartSec=30
+EnvironmentFile=/home/ubuntu/bot/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-watcher
+
+[Install]
+WantedBy=multi-user.target
