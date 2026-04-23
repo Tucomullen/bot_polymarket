@@ -23,7 +23,9 @@ STRATEGY_SMART_MONEY = "smart_money"
 
 # Asignación por defecto — ajustable vía .env en el futuro
 DEFAULT_ALLOCATIONS: dict[str, float] = {
-    STRATEGY_MM: 1.0,  # 100% mientras solo existe MM; se reparte al añadir estrategias
+    STRATEGY_MM: 0.60,           # Market making: 60%
+    STRATEGY_ARB: 0.20,          # Arb YES+NO: 20%
+    STRATEGY_SMART_MONEY: 0.20,  # Smart Money copying: 20%
 }
 
 
@@ -111,7 +113,7 @@ class PortfolioAllocator:
 
     def record_fill(
         self,
-        strategy_id: str,
+        _strategy_id: str,
         condition_id: str,
         side: str,
         price: float,

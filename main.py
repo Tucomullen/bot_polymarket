@@ -45,6 +45,8 @@ from src.risk_manager import RiskManager
 from src.dashboard import DashboardServer, BotState, DashboardLogHandler
 from src.telegram_alerts import TelegramAlerter
 from src.portfolio import PortfolioAllocator, DEFAULT_ALLOCATIONS
+from src.arb_loop import ArbLoop
+from src.smart_money import SmartMoneyLoop, SmartMoneyConfig
 
 
 def _optional_env(name: str, default: str = "") -> str:
@@ -427,7 +429,25 @@ async def run_bot() -> None:
     if discovery:
         tasks.append(asyncio.create_task(_rescan_loop(), name="rescan"))
 
-    logger.info("🚀 Bot iniciado — WebSocket + Trading Loop + Re-scan activos")
+    # Arb YES+NO loop — corre siempre, independiente del discovery
+    arb_loop = ArbLoop(
+        portfolio=portfolio,
+        clob_client=clob_client,
+        simulation=cfg.simulation_mode,
+    )
+    tasks.append(asyncio.create_task(arb_loop.run(), name="arb"))
+
+    # Smart Money loop — wallets configuradas vía SMART_MONEY_WALLETS en .env
+    sm_cfg = SmartMoneyConfig.from_env()
+    smart_money_loop = SmartMoneyLoop(
+        cfg=sm_cfg,
+        portfolio=portfolio,
+        clob_client=clob_client,
+        simulation=cfg.simulation_mode,
+    )
+    tasks.append(asyncio.create_task(smart_money_loop.run(), name="smart_money"))
+
+    logger.info("🚀 Bot iniciado — WebSocket + Trading Loop + Arb + Smart Money + Re-scan activos")
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
     finally:
