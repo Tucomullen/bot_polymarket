@@ -25,6 +25,7 @@ from src.orderbook import OrderbookTracker
 from src.quoting import QuotingEngine, QuotingConfig, QuotePair
 from src.order_manager import OrderManager, OrderManagerConfig
 from src.risk_manager import RiskManager
+from src.portfolio import PortfolioAllocator, STRATEGY_MM
 
 QuoteCallback = Callable[[MarketCandidate, QuotePair], None]
 
@@ -47,9 +48,11 @@ class TradingLoop:
         clob_client: Any = None,
         simulation: bool = True,
         bankroll_usd: float = 1000.0,
-        cycle_interval_ms: float = 500,   # Intervalo entre ciclos en ms
+        cycle_interval_ms: float = 500,
         risk_manager: RiskManager | None = None,
         quote_callback: "QuoteCallback | None" = None,
+        portfolio: PortfolioAllocator | None = None,
+        strategy_id: str = STRATEGY_MM,
     ):
         self._markets = markets
         self._orderbook = orderbook
@@ -58,8 +61,10 @@ class TradingLoop:
         self._cycle_interval = cycle_interval_ms / 1000.0
         self._running = False
         self._cycle_count = 0
-        self._risk = risk_manager  # None en modo legacy (sin gestión de riesgo)
+        self._risk = risk_manager
         self._quote_callback = quote_callback
+        self._portfolio = portfolio
+        self._strategy_id = strategy_id
 
         # Componentes
         self._quoting = QuotingEngine(
@@ -166,12 +171,19 @@ class TradingLoop:
         # Obtener inventario actual
         inv_yes, inv_no = self._orders.get_inventory(market.condition_id)
 
+        # Budget: usa el disponible de la estrategia si hay portfolio, si no el bankroll total
+        budget = (
+            self._portfolio.get_available(self._strategy_id)
+            if self._portfolio is not None
+            else self._bankroll
+        )
+
         # Generar nuevas quotes (con Kelly sizing si hay risk_manager)
         pair = self._quoting.generate_quotes(
             market=market,
             inventory_yes=inv_yes,
             inventory_no=inv_no,
-            bankroll_usd=self._bankroll,
+            bankroll_usd=budget,
             risk_manager=self._risk,
         )
 

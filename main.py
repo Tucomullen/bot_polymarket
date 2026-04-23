@@ -44,6 +44,7 @@ from src.quoting import QuotePair
 from src.risk_manager import RiskManager
 from src.dashboard import DashboardServer, BotState, DashboardLogHandler
 from src.telegram_alerts import TelegramAlerter
+from src.portfolio import PortfolioAllocator, DEFAULT_ALLOCATIONS
 
 
 def _optional_env(name: str, default: str = "") -> str:
@@ -311,6 +312,12 @@ async def run_bot() -> None:
         float(_optional_env("MAX_SESSION_LOSS_PCT", "0.05")) * 100,
     )
 
+    portfolio = PortfolioAllocator(
+        bankroll=bankroll_usd,
+        allocations=DEFAULT_ALLOCATIONS,
+        risk_manager=risk_manager,
+    )
+
     def _on_quote(market: MarketCandidate, pair: QuotePair) -> None:
         """Actualiza el dashboard con los precios reales de la quote generada."""
         bot_state.update_quote(
@@ -331,6 +338,7 @@ async def run_bot() -> None:
             cycle_interval_ms=float(_optional_env("CYCLE_INTERVAL_MS", "500")),
             risk_manager=risk_manager,
             quote_callback=_on_quote,
+            portfolio=portfolio,
         )
         logger.info(
             "🔄 Trading loop configurado — %d mercados, simulation=%s",

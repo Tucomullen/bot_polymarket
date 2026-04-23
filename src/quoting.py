@@ -350,9 +350,10 @@ class QuotingEngine:
         Calcula el tamaño de la orden en USD.
         """
         if risk_manager is not None:
-            # Kelly fraccional: el risk_manager considera exposición total y Kelly
+            # Kelly fraccional usando el budget de la estrategia (no el bankroll total)
             kelly_max = risk_manager.max_order_size_usd(
-                market.condition_id, half_spread_cents, mid_price
+                market.condition_id, half_spread_cents, mid_price,
+                budget_override=bankroll_usd if bankroll_usd > 0 else None,
             )
             # Escalar por score (mejor mercado → más del presupuesto Kelly)
             if self.cfg.scale_size_by_score and market.score > 0:

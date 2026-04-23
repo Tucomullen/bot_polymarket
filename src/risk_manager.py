@@ -15,7 +15,7 @@ Fórmula Kelly para market making:
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger("polybot.risk")
 
@@ -176,30 +176,37 @@ class RiskManager:
 
     def max_order_size_usd(
         self,
-        condition_id: str,
+        condition_id: str,  # reservado para caps por mercado en fases futuras
         half_spread_cents: float,
         mid_price: float,
+        budget_override: float | None = None,
     ) -> float:
         """
         Tamaño máximo de orden (USD) según Kelly fraccional.
 
         Kelly para market making:
           edge = (half_spread_cents / 100) / mid_price
-          kelly_size = bankroll * kelly_fraction * edge * 2
+          kelly_size = budget * kelly_fraction * edge * 2
+
+        budget_override: si se pasa, se usa como bankroll para Kelly y el hard cap
+          por orden (útil con PortfolioAllocator para limitar por estrategia).
+          El límite de exposición total sigue usando self._bankroll completo.
 
         Limitado por:
-          - max_order_risk_pct * bankroll (hard cap por orden)
-          - capacidad restante hasta max_total_exposure_pct * bankroll
+          - max_order_risk_pct * budget (hard cap por orden)
+          - capacidad restante hasta max_total_exposure_pct * bankroll total
         """
-        # Kelly sizing
+        budget = budget_override if budget_override is not None else self._bankroll
+
+        # Kelly sizing sobre el budget de la estrategia
         if mid_price > 0 and half_spread_cents > 0:
             edge = (half_spread_cents / 100.0) / mid_price
-            kelly_size = self._bankroll * self._kelly * edge * 2.0
+            kelly_size = budget * self._kelly * edge * 2.0
         else:
-            kelly_size = self._bankroll * self._max_order_pct
+            kelly_size = budget * self._max_order_pct
 
-        # Hard cap por orden individual
-        max_per_order = self._bankroll * self._max_order_pct
+        # Hard cap por orden individual (sobre el budget, no el bankroll total)
+        max_per_order = budget * self._max_order_pct
         size = min(kelly_size, max_per_order)
 
         # Respetar límite de exposición total
